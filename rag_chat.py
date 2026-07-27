@@ -193,4 +193,7 @@ if __name__ == "__main__":
             },
             config=config,
         )
+<<<<<<< HEAD
         print("Bot:", result["messages"][-1].content, "\n")
+=======
+>>>>>>> b020e0e2cf546a34875764deb0bc2b0d02b6ed8
