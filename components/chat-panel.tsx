@@ -6,7 +6,7 @@ import { RAGClient } from '@/lib/api-client'
 import { getApiBaseUrl } from '@/lib/env-config'
 import { MessageComponent } from '@/components/message'
 import { ChatInput } from '@/components/chat-input'
-import { DocumentsMultiSelect } from '@/components/documents-multi-select'
+import { ThemeSwitcher } from '@/components/theme-switcher'
 import { AlertCircle, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 
@@ -22,10 +22,6 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     addMessage,
     addDocument,
     updateDocumentStatus,
-    removeDocument,
-    toggleDocumentSelection,
-    selectAllDocuments,
-    clearDocumentSelection,
     getSelectedDocuments,
     backendUrl,
     setBackendUrl,
@@ -74,11 +70,11 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     addMessage(notebookId, conversation.id, userMessage)
 
     try {
-      // Get selected documents for the query
+      // Get selected documents for the query (varsayilan olarak hepsi secili gelir)
       const selectedDocs = getSelectedDocuments(notebookId, conversation.id)
       const documentIds = selectedDocs.map((d) => d.id)
 
-      const response = await ragClient.chat({ 
+      const response = await ragClient.chat({
         query: content,
         documentIds: documentIds.length > 0 ? documentIds : undefined,
         knowledgeSources: selectedDocs.map((d) => d.name),
@@ -106,7 +102,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     setError(null)
     const docId = `doc-${Date.now()}`
 
-    // Add document with uploading status
+    // Add document with uploading status (store, kaynagi otomatik olarak secili kaynaklara ekler)
     addDocument(notebookId, conversation.id, {
       id: docId,
       name: file.name,
@@ -127,22 +123,6 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     }
   }
 
-  const handleRemoveDocument = async (docId: string) => {
-    if (!conversation || !notebookId) return
-
-    const doc = conversation.documents.find((d) => d.id === docId)
-    if (!doc) return
-
-    try {
-      await ragClient.deleteDocument(doc.name)
-      removeDocument(notebookId, conversation.id, docId)
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Failed to delete'
-      setError(errorMessage)
-      console.error('[v0] Delete error:', errorMessage)
-    }
-  }
-
   const handleUpdateBackend = () => {
     setBackendUrl(tempBackendUrl)
     setShowBackendSetup(false)
@@ -160,20 +140,26 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
 
   return (
     <div className="flex-1 flex flex-col h-screen md:h-full">
-      {/* Header */}
-      <div className="border-b border-border p-4">
-        <h1 className="text-xl font-bold truncate">{conversation.title}</h1>
-        <div className="flex items-center gap-2 mt-2 text-xs text-muted-foreground">
-          <span>{conversation.messages.length} messages</span>
-          <span>•</span>
-          <span>{conversation.documents.length} documents</span>
-          <span>•</span>
-          <button
-            onClick={() => setShowBackendSetup(!showBackendSetup)}
-            className="hover:text-foreground transition-colors"
-          >
-            Backend: {backendUrl.split('//')[1] || backendUrl}
-          </button>
+      {/* Header with Theme Switcher Integration */}
+      <div className="border-b border-border p-4 flex items-center justify-between">
+        <div>
+          <h1 className="text-xl font-bold truncate">{conversation.title}</h1>
+          <div className="flex items-center gap-2 mt-2 text-xs text-muted-foreground">
+            <span>{conversation.messages.length} messages</span>
+            <span>•</span>
+            <span>{conversation.documents.length} documents</span>
+            <span>•</span>
+            <button
+              onClick={() => setShowBackendSetup(!showBackendSetup)}
+              className="hover:text-foreground transition-colors"
+            >
+              Backend: {backendUrl.split('//')[1] || backendUrl}
+            </button>
+          </div>
+        </div>
+        {/* Theme Logo / Dropdown Toggle Button */}
+        <div className="flex items-center gap-2">
+          <ThemeSwitcher />
         </div>
       </div>
 
@@ -254,21 +240,8 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         </div>
       )}
 
-      {/* Sidebar: Documents and Chat Input */}
-      <div className="border-t border-border p-4 space-y-4">
-        {conversation.documents.length > 0 && (
-          <div>
-            <h3 className="text-sm font-semibold mb-2">Knowledge Sources</h3>
-            <DocumentsMultiSelect
-              documents={conversation.documents}
-              selectedIds={conversation.selectedDocumentIds}
-              onToggleSelect={(docId) => toggleDocumentSelection(notebookId, conversation.id, docId)}
-              onSelectAll={() => selectAllDocuments(notebookId, conversation.id)}
-              onClearAll={() => clearDocumentSelection(notebookId, conversation.id)}
-              onRemove={handleRemoveDocument}
-            />
-          </div>
-        )}
+      {/* Chat Input (belge secimi artik sol panelde / Sidebar bileseninde) */}
+      <div className="border-t border-border p-4">
         <ChatInput
           onSendMessage={handleSendMessage}
           onUploadFile={handleUploadFile}

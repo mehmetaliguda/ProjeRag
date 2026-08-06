@@ -12,7 +12,8 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     if (typeof window !== 'undefined') {
       const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
       const stored = localStorage.getItem('theme') as ThemeType | null
-      const themeToUse = stored || (prefersDark ? 'dark' : 'light')
+      // Inside your ThemeProvider (or store setup)
+      const themeToUse = stored || 'light'; // Falls back strictly to light instead of forcing dark system preference if none is stored
       setTheme(themeToUse)
     }
   }, [setTheme])
