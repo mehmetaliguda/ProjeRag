@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
+import { ragClient } from '@/lib/api-client'
 
 export type ThemeType = 'light' | 'dark' | 'dust-pink' | 'blue' | 'green' | 'purple'
 
@@ -57,21 +58,25 @@ interface AppStore {
   backendUrl: string
   hasHydrated: boolean
 
+  // Server sync
+  useServerSync: boolean
+  syncWarning: string | null
+
   // Notebook actions
-  createNotebook: (name: string) => string
+  createNotebook: (name: string) => Promise<string>
   deleteNotebook: (id: string) => void
   renameNotebook: (id: string, name: string) => void
   setCurrentNotebook: (id: string) => void
   getCurrentNotebook: () => Notebook | null
 
   // Conversation actions (within notebooks)
-  createConversation: (notebookId: string, title: string) => string
+  createConversation: (notebookId: string, title: string) => Promise<string>
   deleteConversation: (notebookId: string, conversationId: string) => void
   setCurrentConversation: (notebookId: string, conversationId: string) => void
   getCurrentConversation: () => Conversation | null
 
   // Message actions
-  addMessage: (notebookId: string, conversationId: string, message: Message) => void
+  addMessage: (notebookId: string, conversationId: string, message: Message) => Promise<void>
   updateMessage: (notebookId: string, conversationId: string, messageId: string, content: string) => void
 
   // Document actions
@@ -94,6 +99,11 @@ interface AppStore {
   setSidebarOpen: (open: boolean) => void
   setBackendUrl: (url: string) => void
   setHasHydrated: (state: boolean) => void
+
+  // Server sync actions
+  setUseServerSync: (value: boolean) => void
+  loadFromServer: () => Promise<void>
+  clearSyncWarning: () => void
 }
 
 // localStorage'daki her sey string olarak saklandigi icin, ISO formatindaki
@@ -110,10 +120,19 @@ export const useAppStore = create<AppStore>()(
       sidebarOpen: true,
       backendUrl: 'http://127.0.0.1:5000',
       hasHydrated: false,
+      useServerSync: false,
+      syncWarning: null,
 
       // Notebook actions
-      createNotebook: (name: string) => {
-        const id = `nb-${Date.now()}`
+      createNotebook: async (name: string) => {
+        const { useServerSync } = get()
+
+        // Sunucu senkronu acikken id'yi backend uretir (POST /notebooks -> {id, name});
+        // basarisiz olursa lokal state'e hic dokunmadan hata firlatilir.
+        const id = useServerSync
+          ? (await ragClient.createNotebook(name)).id
+          : `nb-${Date.now()}`
+
         const newNotebook: Notebook = {
           id,
           name,
@@ -160,8 +179,14 @@ export const useAppStore = create<AppStore>()(
       },
 
       // Conversation actions
-      createConversation: (notebookId: string, title: string) => {
-        const convId = `conv-${Date.now()}`
+      createConversation: async (notebookId: string, title: string) => {
+        const { useServerSync } = get()
+
+        // POST /notebooks/<nb_id>/conversations -> {id, title}
+        const convId = useServerSync
+          ? (await ragClient.createConversation(notebookId, title)).id
+          : `conv-${Date.now()}`
+
         const newConversation: Conversation = {
           id: convId,
           title,
@@ -216,7 +241,17 @@ export const useAppStore = create<AppStore>()(
       },
 
       // Message actions
-      addMessage: (notebookId: string, conversationId: string, message: Message) => {
+      addMessage: async (notebookId: string, conversationId: string, message: Message) => {
+        const { useServerSync } = get()
+
+        // POST /conversations/<conv_id>/messages -> lokal state ancak basari sonrasi guncellenir
+        if (useServerSync) {
+          await ragClient.addMessage(conversationId, {
+            role: message.role,
+            content: message.content,
+          })
+        }
+
         set((state) => ({
           notebooks: state.notebooks.map((nb) =>
             nb.id === notebookId
@@ -451,6 +486,62 @@ export const useAppStore = create<AppStore>()(
       setHasHydrated: (state: boolean) => {
         set({ hasHydrated: state })
       },
+
+      // Server sync actions
+      setUseServerSync: (value: boolean) => {
+        const { notebooks } = get()
+        const hasStaleLocalData = notebooks.length > 0
+
+        set({
+          useServerSync: value,
+          syncWarning:
+            value && hasStaleLocalData
+              ? 'Sunucu senkronu acildi ancak localStorage\'da zaten notebook/conversation verisi var. Bunlar sunucuda olmayabilir - loadFromServer() cagirarak sunucudaki veriyle degistirmeni oneririz.'
+              : null,
+        })
+      },
+
+      clearSyncWarning: () => set({ syncWarning: null }),
+
+      loadFromServer: async () => {
+        // GET /notebooks -> [{id, name}], sonra her notebook icin
+        // GET /notebooks/<nb_id>/conversations -> [{id, title}]
+        // Not: mesajlar bu adimda cekilmiyor (gorev kapsaminda yok), bu yuzden
+        // sunucudan gelen conversation'lar bos messages/documents ile baslar.
+        const serverNotebooks = await ragClient.getNotebooks()
+
+        const notebooks: Notebook[] = await Promise.all(
+          serverNotebooks.map(async (nb) => {
+            const serverConversations = await ragClient.getConversations(nb.id)
+            const conversations: Conversation[] = serverConversations.map((c) => ({
+              id: c.id,
+              title: c.title,
+              messages: [],
+              documents: [],
+              selectedDocumentIds: [],
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            }))
+
+            return {
+              id: nb.id,
+              name: nb.name,
+              documentCount: 0,
+              conversations,
+              mssqlConfig: null,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            }
+          })
+        )
+
+        set({
+          notebooks,
+          currentNotebookId: null,
+          currentConversationId: null,
+          syncWarning: null,
+        })
+      },
     }),
     {
       name: 'rag-notebook-storage',
@@ -469,9 +560,15 @@ export const useAppStore = create<AppStore>()(
         currentConversationId: state.currentConversationId,
         theme: state.theme,
         backendUrl: state.backendUrl,
+        useServerSync: state.useServerSync,
       }),
       onRehydrateStorage: () => (state) => {
         state?.setHasHydrated(true)
+        // useServerSync acikken localStorage'dan gelen eski notebook/conversation
+        // verisi varsa kullaniciyi uyar (sunucudaki gercek veriyle uyusmayabilir).
+        if (state?.useServerSync && state.notebooks.length > 0) {
+          state.setUseServerSync(true)
+        }
       },
     }
   )

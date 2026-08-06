@@ -31,6 +31,9 @@ from dotenv_rag import load_dotenv
 from query_optimizer import QueryOptimizer
 from hybrid_retriever import HybridRetriever, CrossEncoderReranker
 
+from database import db
+from models import Room
+
 load_dotenv()
 
 # ------------------------------------------------------------------
@@ -384,63 +387,43 @@ class RagRoom:
 
 
 class RoomManager:
-    """Butun RagRoom'lari sure boyunca RAM'de tutar."""
+    """Butun RagRoom'lari sure boyunca RAM'de tutar; oda kayitlari DB'de (Room modeli)."""
 
     def __init__(self):
         os.makedirs(ROOMS_ROOT, exist_ok=True)
         self._rooms: Dict[str, RagRoom] = {}
 
-    def _meta_path(self, room_id: str) -> str:
-        return os.path.join(ROOMS_ROOT, room_id, "meta.json")
-
     def list_rooms(self):
-        rooms = []
-        if not os.path.isdir(ROOMS_ROOT):
-            return rooms
-        for room_id in sorted(os.listdir(ROOMS_ROOT)):
-            meta_path = self._meta_path(room_id)
-            if not os.path.exists(meta_path):
-                continue
-            try:
-                with open(meta_path, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-            except Exception:
-                continue
-            rooms.append({"id": room_id, "name": meta.get("display_name", room_id)})
-        return rooms
+        rows = Room.query.order_by(Room.created_at).all()
+        return [{"id": row.id, "name": row.display_name} for row in rows]
 
     def get_room(self, room_id: str) -> RagRoom:
         if room_id in self._rooms:
             return self._rooms[room_id]
 
-        meta_path = self._meta_path(room_id)
-        if not os.path.exists(meta_path):
+        row = Room.query.get(room_id)
+        if row is None:
             raise FileNotFoundError(f"Oda bulunamadi: {room_id}")
 
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-
-        room = RagRoom(room_id, meta["pdf_path"], display_name=meta.get("display_name"))
+        room = RagRoom(room_id, row.pdf_path, display_name=row.display_name)
         self._rooms[room_id] = room
         return room
 
     def create_room_from_upload(self, tmp_pdf_path: str, display_name: str) -> RagRoom:
+        existing = Room.query.filter_by(display_name=display_name).first()
+        if existing is not None:
+            room_id = existing.id
+            permanent_pdf_path = existing.pdf_path
+            shutil.copy(tmp_pdf_path, permanent_pdf_path)
+            self._rooms.pop(room_id, None)
+            room = self.get_room(room_id)
+            room.index_pdf(force=True)
+            return room
+
         base_id = safe_dirname(display_name)
         room_id = base_id
         suffix = 1
-
-        while os.path.exists(os.path.join(ROOMS_ROOT, room_id)):
-            meta_path = self._meta_path(room_id)
-            if os.path.exists(meta_path):
-                with open(meta_path, "r", encoding="utf-8") as f:
-                    existing_meta = json.load(f)
-                if existing_meta.get("display_name") == display_name:
-                    permanent_pdf_path = existing_meta["pdf_path"]
-                    shutil.copy(tmp_pdf_path, permanent_pdf_path)
-                    self._rooms.pop(room_id, None)
-                    room = self.get_room(room_id)
-                    room.index_pdf(force=True)
-                    return room
+        while Room.query.get(room_id) is not None:
             suffix += 1
             room_id = f"{base_id}_{suffix}"
 
@@ -448,9 +431,16 @@ class RoomManager:
         os.makedirs(room_dir, exist_ok=True)
         permanent_pdf_path = os.path.join(room_dir, "source.pdf")
         shutil.copy(tmp_pdf_path, permanent_pdf_path)
+        image_dir = os.path.join(room_dir, "images")
 
-        with open(self._meta_path(room_id), "w", encoding="utf-8") as f:
-            json.dump({"display_name": display_name, "pdf_path": permanent_pdf_path}, f, ensure_ascii=False)
+        new_room = Room(
+            id=room_id,
+            display_name=display_name,
+            pdf_path=permanent_pdf_path,
+            image_dir=image_dir,
+        )
+        db.session.add(new_room)
+        db.session.commit()
 
         room = RagRoom(room_id, permanent_pdf_path, display_name=display_name)
         self._rooms[room_id] = room

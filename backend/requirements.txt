@@ -12,6 +12,7 @@ langchain-core==0.1.0
 pymupdf==1.23.8
 chromadb==0.4.24
 numpy==1.24.3
+flask-sqlalchemy==3.1.1
 
 # Yardımcı kütüphaneler
 python-dotenv==1.0.0

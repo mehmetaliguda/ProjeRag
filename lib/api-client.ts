@@ -22,6 +22,26 @@ export interface UploadResponse {
   uploaded_at: string
 }
 
+// Backend: /notebooks
+export interface Notebook {
+  id: string
+  name: string
+}
+
+// Backend: /notebooks/<nb_id>/conversations
+export interface Conversation {
+  id: string
+  title: string
+}
+
+// Backend: /conversations/<conv_id>/messages
+export interface ConversationMessage {
+  id: string
+  role: string
+  content: string
+  timestamp: string
+}
+
 // Backend'deki room yapısı
 export interface Room {
   id: string
@@ -46,6 +66,7 @@ export interface BackendChatResponse {
 export class RAGClient {
   private client: AxiosInstance
   private currentRoomId: string | null = null
+  private currentConversationId: string | null = null
 
   constructor(baseURL?: string) {
     const finalBaseURL = baseURL || getApiBaseUrl() || 'http://127.0.0.1:5000'
@@ -68,9 +89,13 @@ export class RAGClient {
         throw new Error('Önce bir oda (room) oluşturmalı veya seçmelisiniz!')
       }
 
-      const payload = {
+      const payload: Record<string, unknown> = {
         room: this.currentRoomId,
         soru: request.query
+      }
+
+      if (this.currentConversationId) {
+        payload.conversation_id = this.currentConversationId
       }
 
       const response = await this.client.post<BackendChatResponse>('/chat-client', payload)
@@ -189,6 +214,91 @@ export class RAGClient {
   // Backend: GET /images/<room_id>/<filename>
   async getImageUrl(roomId: string, filename: string): Promise<string> {
     return `${this.client.defaults.baseURL}/images/${roomId}/${filename}`
+  }
+
+  // Mevcut conversation'ı set et
+  setCurrentConversation(conversationId: string | null): void {
+    this.currentConversationId = conversationId
+  }
+
+  // Mevcut conversation'ı getir
+  getCurrentConversation(): string | null {
+    return this.currentConversationId
+  }
+
+  // Backend: POST /notebooks
+  // Beklenen: { "name": "..." }
+  // Dönen: { "id": "...", "name": "..." }
+  async createNotebook(name: string): Promise<Notebook> {
+    try {
+      const response = await this.client.post<Notebook>('/notebooks', { name })
+      return response.data
+    } catch (error) {
+      throw this.handleError(error)
+    }
+  }
+
+  // Backend: GET /notebooks
+  // Dönen: [ { "id": "...", "name": "..." } ]
+  async getNotebooks(): Promise<Notebook[]> {
+    try {
+      const response = await this.client.get<Notebook[]>('/notebooks')
+      return response.data
+    } catch (error) {
+      throw this.handleError(error)
+    }
+  }
+
+  // Backend: POST /notebooks/<nb_id>/conversations
+  // Beklenen: { "title": "..." }
+  // Dönen: { "id": "...", "title": "..." }
+  async createConversation(notebookId: string, title: string): Promise<Conversation> {
+    try {
+      const response = await this.client.post<Conversation>(
+        `/notebooks/${notebookId}/conversations`,
+        { title }
+      )
+      return response.data
+    } catch (error) {
+      throw this.handleError(error)
+    }
+  }
+
+  // Backend: GET /notebooks/<nb_id>/conversations
+  // Dönen: [ { "id": "...", "title": "..." } ]
+  async getConversations(notebookId: string): Promise<Conversation[]> {
+    try {
+      const response = await this.client.get<Conversation[]>(
+        `/notebooks/${notebookId}/conversations`
+      )
+      return response.data
+    } catch (error) {
+      throw this.handleError(error)
+    }
+  }
+
+  // Backend: POST /conversations/<conv_id>/messages
+  // Beklenen: { "role": "...", "content": "..." }
+  // Dönen: { "id": "...", "role": "...", "content": "...", "timestamp": "..." }
+  async addMessage(conversationId: string, message: { role: string; content: string }): Promise<void> {
+    try {
+      await this.client.post(`/conversations/${conversationId}/messages`, message)
+    } catch (error) {
+      throw this.handleError(error)
+    }
+  }
+
+  // Backend: GET /conversations/<conv_id>/messages
+  // Dönen: [ { "id": "...", "role": "...", "content": "...", "timestamp": "..." } ]
+  async getMessages(conversationId: string): Promise<ConversationMessage[]> {
+    try {
+      const response = await this.client.get<ConversationMessage[]>(
+        `/conversations/${conversationId}/messages`
+      )
+      return response.data
+    } catch (error) {
+      throw this.handleError(error)
+    }
   }
 
   // Not: Backend'de delete ve reset endpoint'leri yok
