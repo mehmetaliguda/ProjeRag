@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
-import { ragClient } from '@/lib/api-client'
+import { ragClient, CitationInfo } from '@/lib/api-client'
 
 export type ThemeType = 'light' | 'dark' | 'dust-pink' | 'blue' | 'green' | 'purple'
 
@@ -9,6 +9,7 @@ export interface Message {
   role: 'user' | 'assistant'
   content: string
   timestamp: Date
+  citations?: Record<string, CitationInfo>
 }
 
 export interface Document {
@@ -33,16 +34,17 @@ export interface Conversation {
   id: string
   title: string
   messages: Message[]
-  documents: Document[]
-  selectedDocumentIds: string[] // Track multiple selected documents
+  selectedDocumentIds: string[] // Track multiple selected documents (from notebook.documents)
   createdAt: Date
   updatedAt: Date
 }
 
 export interface Notebook {
+  currentConversationId: string
   id: string
   name: string
   documentCount: number
+  documents: Document[] // Notebook-global; shared across all conversations
   conversations: Conversation[]
   mssqlConfig: MSSQLConfig | null
   createdAt: Date
@@ -79,16 +81,21 @@ interface AppStore {
   addMessage: (notebookId: string, conversationId: string, message: Message) => Promise<void>
   updateMessage: (notebookId: string, conversationId: string, messageId: string, content: string) => void
 
-  // Document actions
-  addDocument: (notebookId: string, conversationId: string, document: Document) => void
-  updateDocumentStatus: (notebookId: string, conversationId: string, docId: string, status: Document['status']) => void
-  removeDocument: (notebookId: string, conversationId: string, docId: string) => void
+  // Document actions (notebook-global)
+  addDocumentsToNotebook: (notebookId: string, documents: Document[]) => void
+  removeDocumentFromNotebook: (notebookId: string, docId: string) => void
+  updateDocumentStatus: (notebookId: string, docId: string, status: Document['status']) => void
+  getNotebookDocuments: (notebookId: string) => Document[]
 
   // Document selection actions (multi-select)
   toggleDocumentSelection: (notebookId: string, conversationId: string, docId: string) => void
   selectAllDocuments: (notebookId: string, conversationId: string) => void
   clearDocumentSelection: (notebookId: string, conversationId: string) => void
   getSelectedDocuments: (notebookId: string, conversationId: string) => Document[]
+
+  // Citation panel state
+  activeCitation: CitationInfo | null
+  setActiveCitation: (citation: CitationInfo | null) => void
 
   // MSSQL Config actions
   setMSSQLConfig: (notebookId: string, config: MSSQLConfig) => void
@@ -122,6 +129,7 @@ export const useAppStore = create<AppStore>()(
       hasHydrated: false,
       useServerSync: false,
       syncWarning: null,
+      activeCitation: null,
 
       // Notebook actions
       createNotebook: async (name: string) => {
@@ -137,6 +145,7 @@ export const useAppStore = create<AppStore>()(
           id,
           name,
           documentCount: 0,
+          documents: [],
           conversations: [],
           mssqlConfig: null,
           createdAt: new Date(),
@@ -191,7 +200,6 @@ export const useAppStore = create<AppStore>()(
           id: convId,
           title,
           messages: [],
-          documents: [],
           selectedDocumentIds: [],
           createdAt: new Date(),
           updatedAt: new Date(),
@@ -297,81 +305,87 @@ export const useAppStore = create<AppStore>()(
         }))
       },
 
-      // Document actions
-      addDocument: (notebookId: string, conversationId: string, document: Document) => {
+      // Document actions (notebook-global — shared across all conversations)
+      addDocumentsToNotebook: (notebookId: string, documents: Document[]) => {
+        const { currentConversationId } = get()
+
         set((state) => ({
-          notebooks: state.notebooks.map((nb) =>
-            nb.id === notebookId
-              ? {
-                  ...nb,
-                  documentCount: nb.documentCount + 1,
-                  conversations: nb.conversations.map((c) =>
-                    c.id === conversationId
-                      ? {
-                          ...c,
-                          documents: [...c.documents, document],
-                          // Yeni yuklenen belge, kaynak secimine varsayilan olarak dahil edilir
-                          selectedDocumentIds: c.selectedDocumentIds.includes(document.id)
-                            ? c.selectedDocumentIds
-                            : [...c.selectedDocumentIds, document.id],
-                          updatedAt: new Date(),
-                        }
-                      : c
-                  ),
-                  updatedAt: new Date(),
-                }
-              : nb
-          ),
+          notebooks: state.notebooks.map((nb) => {
+            if (nb.id !== notebookId) return nb
+
+            // id'ye gore dedupe et: ayni id zaten varsa yeni gelenle degistir, yoksa ekle
+            const existingIds = new Set(nb.documents.map((d) => d.id))
+            const merged = [
+              ...nb.documents.filter((d) => !documents.some((nd) => nd.id === d.id)),
+              ...documents,
+            ]
+            const newlyAddedIds = documents
+              .filter((d) => !existingIds.has(d.id))
+              .map((d) => d.id)
+
+            return {
+              ...nb,
+              documentCount: merged.length,
+              documents: merged,
+              // ISTISNA: aktif conversation bu notebook'a aitse ve selectedDocumentIds
+              // bossa, yeni eklenen dokumanlari otomatik secili yap.
+              conversations: nb.conversations.map((c) =>
+                c.id === currentConversationId && c.selectedDocumentIds.length === 0
+                  ? {
+                      ...c,
+                      selectedDocumentIds: newlyAddedIds,
+                      updatedAt: new Date(),
+                    }
+                  : c
+              ),
+              updatedAt: new Date(),
+            }
+          }),
         }))
       },
 
-      updateDocumentStatus: (notebookId: string, conversationId: string, docId: string, status: Document['status']) => {
-        set((state) => ({
-          notebooks: state.notebooks.map((nb) =>
-            nb.id === notebookId
-              ? {
-                  ...nb,
-                  conversations: nb.conversations.map((c) =>
-                    c.id === conversationId
-                      ? {
-                          ...c,
-                          documents: c.documents.map((d) =>
-                            d.id === docId ? { ...d, status } : d
-                          ),
-                          updatedAt: new Date(),
-                        }
-                      : c
-                  ),
-                  updatedAt: new Date(),
-                }
-              : nb
-          ),
-        }))
-      },
-
-      removeDocument: (notebookId: string, conversationId: string, docId: string) => {
+      removeDocumentFromNotebook: (notebookId: string, docId: string) => {
         set((state) => ({
           notebooks: state.notebooks.map((nb) =>
             nb.id === notebookId
               ? {
                   ...nb,
                   documentCount: Math.max(0, nb.documentCount - 1),
-                  conversations: nb.conversations.map((c) =>
-                    c.id === conversationId
-                      ? {
-                          ...c,
-                          documents: c.documents.filter((d) => d.id !== docId),
-                          // Silinen belge kaynak secim listesinden de cikarilir
-                          selectedDocumentIds: c.selectedDocumentIds.filter((id) => id !== docId),
-                          updatedAt: new Date(),
-                        }
-                      : c
+                  documents: nb.documents.filter((d) => d.id !== docId),
+                  // Silinen belge, notebook'taki TUM conversation'larin secim
+                  // listesinden de cikarilir.
+                  conversations: nb.conversations.map((c) => ({
+                    ...c,
+                    selectedDocumentIds: c.selectedDocumentIds.filter((id) => id !== docId),
+                    updatedAt: new Date(),
+                  })),
+                  updatedAt: new Date(),
+                }
+              : nb
+          ),
+        }))
+      },
+
+      updateDocumentStatus: (notebookId: string, docId: string, status: Document['status']) => {
+        set((state) => ({
+          notebooks: state.notebooks.map((nb) =>
+            nb.id === notebookId
+              ? {
+                  ...nb,
+                  documents: nb.documents.map((d) =>
+                    d.id === docId ? { ...d, status } : d
                   ),
                   updatedAt: new Date(),
                 }
               : nb
           ),
         }))
+      },
+
+      getNotebookDocuments: (notebookId: string) => {
+        const state = get()
+        const notebook = state.notebooks.find((nb) => nb.id === notebookId)
+        return notebook?.documents || []
       },
 
       // MSSQL Config actions
@@ -426,7 +440,7 @@ export const useAppStore = create<AppStore>()(
                     c.id === conversationId
                       ? {
                           ...c,
-                          selectedDocumentIds: c.documents.map((d) => d.id),
+                          selectedDocumentIds: nb.documents.map((d) => d.id),
                           updatedAt: new Date(),
                         }
                       : c
@@ -464,8 +478,12 @@ export const useAppStore = create<AppStore>()(
         const state = get()
         const notebook = state.notebooks.find((nb) => nb.id === notebookId)
         const conversation = notebook?.conversations.find((c) => c.id === conversationId)
-        if (!conversation) return []
-        return conversation.documents.filter((d) => conversation.selectedDocumentIds.includes(d.id))
+        if (!notebook || !conversation) return []
+        return notebook.documents.filter((d) => conversation.selectedDocumentIds.includes(d.id))
+      },
+
+      setActiveCitation: (citation: CitationInfo | null) => {
+        set({ activeCitation: citation })
       },
 
       setTheme: (theme: ThemeType) => {
@@ -517,7 +535,6 @@ export const useAppStore = create<AppStore>()(
               id: c.id,
               title: c.title,
               messages: [],
-              documents: [],
               selectedDocumentIds: [],
               createdAt: new Date(),
               updatedAt: new Date(),
@@ -527,6 +544,7 @@ export const useAppStore = create<AppStore>()(
               id: nb.id,
               name: nb.name,
               documentCount: 0,
+              documents: [],
               conversations,
               mssqlConfig: null,
               createdAt: new Date(),
@@ -545,6 +563,7 @@ export const useAppStore = create<AppStore>()(
     }),
     {
       name: 'rag-notebook-storage',
+      version: 2,
       storage: createJSONStorage(() => localStorage, {
         reviver: (_key, value) => {
           if (typeof value === 'string' && ISO_DATE_RE.test(value)) {
@@ -553,6 +572,48 @@ export const useAppStore = create<AppStore>()(
           return value
         },
       }),
+      // v1 -> v2: Document, Conversation seviyesinden Notebook seviyesine tasindi.
+      // Eski state'te her conversation kendi documents[] dizisine sahipti; artik
+      // bu dizi notebook.documents altinda TEK ve PAYLASIMLI. Eski kullanicilarin
+      // localStorage verisini kaybetmemesi icin burada donusturuyoruz.
+      migrate: (persistedState: unknown, version: number) => {
+        const state = persistedState as { notebooks?: any[] } & Record<string, unknown>
+
+        if (version >= 2 || !state?.notebooks) {
+          return state as AppStore
+        }
+
+        const notebooks = state.notebooks.map((nb: any) => {
+          // Eski conversation'lardaki documents dizilerini id'ye gore dedupe ederek topla
+          const collected = new Map<string, Document>()
+          for (const conv of nb.conversations || []) {
+            for (const doc of conv.documents || []) {
+              collected.set(doc.id, doc)
+            }
+          }
+
+          const conversations = (nb.conversations || []).map((conv: any) => {
+            const oldDocs: Document[] = conv.documents || []
+            const { documents: _drop, ...rest } = conv
+            return {
+              ...rest,
+              // selectedDocumentIds yoksa eski conversation'daki dokuman id'lerini kullan
+              selectedDocumentIds:
+                conv.selectedDocumentIds && conv.selectedDocumentIds.length > 0
+                  ? conv.selectedDocumentIds
+                  : oldDocs.map((d) => d.id),
+            }
+          })
+
+          return {
+            ...nb,
+            documents: Array.from(collected.values()),
+            conversations,
+          }
+        })
+
+        return { ...state, notebooks } as AppStore
+      },
       // sidebarOpen / hasHydrated gibi UI-only state'leri kalici hale getirmeye gerek yok
       partialize: (state) => ({
         notebooks: state.notebooks,

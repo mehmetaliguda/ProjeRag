@@ -3,8 +3,8 @@ import { getApiBaseUrl } from '@/lib/env-config'
 
 export interface ChatRequest {
   query: string
-  documentIds?: string[]
-  knowledgeSources?: string[]
+  documentIds?: string[]        // artik gercekten kullaniliyor: secili room id'leri
+  knowledgeSources?: string[]   // dokunulmadi, kapsam disi
 }
 
 export interface ChatResponse {
@@ -45,21 +45,21 @@ export interface ConversationMessage {
 // Backend'deki room yapısı
 export interface Room {
   id: string
-  display_name: string
-  pdf_path: string
-  image_dir: string
-  created_at: string
+  name: string
+}
+
+// Tek bir citation'ın şekli — store.ts ve UI bileşenleri bunu import eder
+export interface CitationInfo {
+  page: number
+  image: string | null
+  text: string
+  pdf_url: string | null
 }
 
 // Backend'den gelen chat yanıtı
 export interface BackendChatResponse {
   text: string
-  citations: Record<string, {
-    page: number
-    image: string | null
-    text: string
-    pdf_url: string | null
-  }>
+  citations: Record<string, CitationInfo>
   status: string
 }
 
@@ -94,6 +94,17 @@ export class RAGClient {
         soru: request.query
       }
 
+      // documentIds doluysa secili room'lari payload'a ekle.
+      // NOT: backend /chat-client endpoint'i su an muhtemelen sadece `room`
+      // alanini okuyor; `rooms` destegi backend'de yoksa coklu-PDF sorgulari
+      // yine sadece ilk dokumani kullanacaktir. Bu bilinen bir sinirlama,
+      // backend guncellenene kadar gecerli.
+      if (request.documentIds && request.documentIds.length > 0) {
+        // Geriye donuk uyumluluk icin ilk secili dokumani `room` olarak da gonder
+        payload.room = request.documentIds[0]
+        payload.rooms = request.documentIds
+      }
+
       if (this.currentConversationId) {
         payload.conversation_id = this.currentConversationId
       }
@@ -120,7 +131,7 @@ export class RAGClient {
 
   // Backend: POST /rooms
   // Beklenen: multipart/form-data ile 'file' alanında PDF
-  // Dönen: { "room": { "id": "...", "display_name": "...", ... } }
+  // Dönen (flat): { "id": "...", "name": "..." }
   async uploadFile(file: File): Promise<UploadResponse> {
     try {
       const formData = new FormData()
@@ -132,15 +143,16 @@ export class RAGClient {
         },
       })
 
-      // Room ID'yi kaydet
-      if (response.data.room?.id) {
-        this.currentRoomId = response.data.room.id
+      const room = response.data
+
+      if (room?.id) {
+        this.currentRoomId = room.id
       }
 
       return {
-        filename: response.data.room?.display_name || file.name,
+        filename: room?.name || file.name,
         size: file.size,
-        uploaded_at: response.data.room?.created_at || new Date().toISOString()
+        uploaded_at: new Date().toISOString()
       }
     } catch (error) {
       throw this.handleError(error)
@@ -148,16 +160,16 @@ export class RAGClient {
   }
 
   // Backend: GET /rooms
-  // Dönen: { "rooms": [ { "id": "...", "display_name": "...", ... } ] }
+  // Dönen: { "rooms": [ { "id": "...", "name": "..." } ] }
   async getDocuments(): Promise<Array<{ name: string; size: number; uploaded_at: string }>> {
     try {
       const response = await this.client.get('/rooms')
       const rooms = response.data.rooms || []
       
       return rooms.map((room: Room) => ({
-        name: room.display_name || room.id || 'Belge',
+        name: room.name || room.id || 'Belge',
         size: 0, // Backend size döndürmüyor
-        uploaded_at: room.created_at || new Date().toISOString()
+        uploaded_at: new Date().toISOString()
       }))
     } catch (error) {
       throw this.handleError(error)
@@ -175,6 +187,8 @@ export class RAGClient {
   }
 
   // Backend: POST /rooms (yeni room oluştur)
+  // Beklenen: multipart/form-data ile 'file' alanında PDF
+  // Dönen (flat): { "id": "...", "name": "..." }
   async createRoom(file: File): Promise<Room> {
     try {
       const formData = new FormData()
@@ -186,14 +200,43 @@ export class RAGClient {
         },
       })
 
-      if (response.data.room?.id) {
-        this.currentRoomId = response.data.room.id
+      const room = response.data
+
+      if (room?.id) {
+        this.currentRoomId = room.id
       }
 
-      return response.data.room
+      return room
     } catch (error) {
       throw this.handleError(error)
     }
+  }
+
+  // Backend /rooms TEK dosya kabul ediyor; coklu dosya icin bu metod
+  // createRoom'u her dosya icin paralel cagirir. Promise.allSettled kullanildigi
+  // icin bir dosyanin basarisiz olmasi digerlerini etkilemez.
+  // Not: createRoom icindeki `this.currentRoomId = ...` yan etkisi burada da
+  // calisir; sirali cagrilarda en son basariyla yuklenen room currentRoomId
+  // olarak kalir. Bu kabul edilebilir cunku artik chat() hangi room'lari
+  // kullanacagini documentIds ile acikca biliyor.
+  async createRooms(files: File[]): Promise<{ succeeded: Room[]; failed: { file: string; error: string }[] }> {
+    const results = await Promise.allSettled(files.map((file) => this.createRoom(file)))
+
+    const succeeded: Room[] = []
+    const failed: { file: string; error: string }[] = []
+
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        succeeded.push(result.value)
+      } else {
+        failed.push({
+          file: files[index].name,
+          error: result.reason instanceof Error ? result.reason.message : 'Bilinmeyen hata',
+        })
+      }
+    })
+
+    return { succeeded, failed }
   }
 
   // Mevcut room'u set et

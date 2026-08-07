@@ -54,6 +54,13 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 llm = ChatOllama(model=OLLAMA_LLM_MODEL, base_url=OLLAMA_BASE_URL, temperature=0)
 embeddings = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_BASE_URL)
 
+# Coklu-room birlestirmesi icin paylasilan tek instance'lar (her ikisi de
+# sadece global `llm`'e bagimli, room basina ayri instance gerekmiyor).
+_multi_room_query_optimizer = QueryOptimizer(llm=llm)
+_multi_room_reranker = CrossEncoderReranker(llm=llm)
+MULTI_ROOM_RETRIEVE_K = 10   # her room'dan cekilecek aday sayisi
+MULTI_ROOM_TOP_K = 6         # birlestirip rerank sonrasi generate'e giden sayi
+
 
 def safe_dirname(name: str) -> str:
     """Dosya adindan (uzantisiz) chroma_db / oda klasoru icin guvenli isim uretir."""
@@ -130,6 +137,7 @@ class RagRoom:
             print(f"[{self.room_id}] force=True, chroma_db siliniyor.")
             shutil.rmtree(self.chroma_dir)
             os.makedirs(self.chroma_dir, exist_ok=True)
+            self.vectorstore = Chroma(embedding_function=embeddings, persist_directory=self.chroma_dir)
             self._hybrid_initialized = False
 
         if not force:
@@ -186,7 +194,8 @@ class RagRoom:
                 for i, page in enumerate(doc):
                     pix = page.get_pixmap(dpi=150)
                     pix.save(os.path.join(self.image_dir, f"page_{i}.png"))
-            print(f"[{self.room_id}] {len(doc)} sayfa gorseli olusturuldu.")
+                    page_count = len(doc)
+            print(f"[{self.room_id}] {page_count} sayfa gorseli olusturuldu.")
         except Exception as e:
             print(f"[{self.room_id}] Sayfa gorselleri olusturulamadi: {e}")
 
@@ -227,6 +236,24 @@ class RagRoom:
         result = llm.invoke(prompt).content.strip().lower()
         return "evet" in result
 
+    def _ensure_hybrid_initialized(self):
+        """Hybrid retriever'in lazy-init mantigi (mevcut _retrieve icindeki
+        blogun aynisi, sadece kendi metoduna tasindi). Hem tekil _retrieve
+        hem de get_multi_room_answer bu metodu kullanir."""
+        if not self._hybrid_initialized:
+            docs = self.vectorstore.get(include=["documents", "metadatas"])
+            if docs and len(docs.get("ids", [])) > 0:
+                doc_dict, meta_dict = {}, {}
+                metadatas = docs.get("metadatas") or []
+                for i, doc_id in enumerate(docs["ids"]):
+                    content = docs["documents"][i] if i < len(docs["documents"]) else ""
+                    metadata = metadatas[i] if i < len(metadatas) and metadatas[i] else {}
+                    doc_dict[doc_id] = content
+                    meta_dict[doc_id] = {"page": metadata.get("page", -1)}
+                if doc_dict:
+                    self.hybrid_retriever.index_documents(doc_dict, meta_dict)
+                    self._hybrid_initialized = True
+
     def _retrieve(self, state: RAGState):
         question = state["messages"][-1].content
         optimized_query = (
@@ -234,19 +261,7 @@ class RagRoom:
         )
 
         if USE_HYBRID_RETRIEVAL:
-            if not self._hybrid_initialized:
-                docs = self.vectorstore.get(include=["documents", "metadatas"])
-                if docs and len(docs.get("ids", [])) > 0:
-                    doc_dict, meta_dict = {}, {}
-                    metadatas = docs.get("metadatas") or []
-                    for i, doc_id in enumerate(docs["ids"]):
-                        content = docs["documents"][i] if i < len(docs["documents"]) else ""
-                        metadata = metadatas[i] if i < len(metadatas) and metadatas[i] else {}
-                        doc_dict[doc_id] = content
-                        meta_dict[doc_id] = {"page": metadata.get("page", -1)}
-                    if doc_dict:
-                        self.hybrid_retriever.index_documents(doc_dict, meta_dict)
-                        self._hybrid_initialized = True
+            self._ensure_hybrid_initialized()
 
             results = self.hybrid_retriever.retrieve(optimized_query, k=10)
             results = self.reranker.rerank(question, results)[:4] if USE_RERANKER else results[:4]
@@ -410,16 +425,6 @@ class RoomManager:
         return room
 
     def create_room_from_upload(self, tmp_pdf_path: str, display_name: str) -> RagRoom:
-        existing = Room.query.filter_by(display_name=display_name).first()
-        if existing is not None:
-            room_id = existing.id
-            permanent_pdf_path = existing.pdf_path
-            shutil.copy(tmp_pdf_path, permanent_pdf_path)
-            self._rooms.pop(room_id, None)
-            room = self.get_room(room_id)
-            room.index_pdf(force=True)
-            return room
-
         base_id = safe_dirname(display_name)
         room_id = base_id
         suffix = 1
@@ -445,6 +450,126 @@ class RoomManager:
         room = RagRoom(room_id, permanent_pdf_path, display_name=display_name)
         self._rooms[room_id] = room
         return room
+
+
+def get_multi_room_answer(room_ids: List[str], mesaj: str) -> dict:
+    """Birden fazla room'un retrieval sonucunu birlestirip TEK cevap
+    uretir. Tek turlu calisir (LangGraph/MemorySaver KULLANMAZ —
+    query-rewrite retry mantigi da bu ilk versiyonda YOK, bilinen
+    bir sinirlama olarak birak)."""
+    rooms = [room_manager.get_room(rid) for rid in room_ids]
+
+    optimized_query = (
+        _multi_room_query_optimizer.optimize_for_retrieval(mesaj) if USE_QUERY_OPTIMIZER else mesaj
+    )
+
+    all_results = []
+    for room in rooms:
+        room._ensure_hybrid_initialized()
+        results = room.hybrid_retriever.retrieve(optimized_query, k=MULTI_ROOM_RETRIEVE_K)
+        for r in results:
+            r["room_id"] = room.room_id
+        all_results.extend(results)
+
+    reranked = _multi_room_reranker.rerank(mesaj, all_results)[:MULTI_ROOM_TOP_K]
+
+    documents = [
+        Document(
+            page_content=r.get("content", ""),
+            metadata={
+                "source": "hybrid",
+                "doc_id": r.get("doc_id", ""),
+                "score": r.get("score", 0),
+                "rerank_score": r.get("rerank_score", 0),
+                "page": r.get("page", -1),
+                "room_id": r.get("room_id", ""),
+            },
+        )
+        for r in reranked
+    ]
+
+    rooms_by_id = {r.room_id: r for r in rooms}
+
+    # Dedupe key SADECE page degil, room_id + page: ayni sayfa numarasi
+    # farkli PDF'lerde cakisabilir.
+    source_map, numbered_docs, seen_keys = {}, [], set()
+    for doc in documents:
+        page = doc.metadata.get("page", -1)
+        doc_id = doc.metadata.get("doc_id", "")
+        room_id = doc.metadata.get("room_id", "")
+        if page is not None and page >= 0:
+            src_key = f"{room_id}_{page}"
+        elif doc_id:
+            src_key = f"{room_id}_{doc_id}"
+        else:
+            src_key = f"{room_id}_unknown_{len(numbered_docs)}"
+        if src_key in seen_keys:
+            continue
+        seen_keys.add(src_key)
+        idx = len(numbered_docs) + 1
+        source_map[idx] = {
+            "page": page,
+            "doc_id": doc_id,
+            "room_id": room_id,
+            "score": doc.metadata.get("score", 0),
+            "rerank_score": doc.metadata.get("rerank_score", 0),
+        }
+        numbered_docs.append((idx, page, room_id, doc))
+
+    if not numbered_docs:
+        return {"text": "Belgede bu soruyla ilgili yeterli bilgi bulamadim.", "citations": {}}
+
+    context = "\n\n".join(
+        f"[Kaynak {idx}] ({rooms_by_id[room_id].display_name}, Sayfa {page}):\n{doc.page_content}"
+        for idx, page, room_id, doc in numbered_docs
+    )
+
+    prompt = (
+        f"Belge baglami:\n{context}\n\n"
+        f"Soru: {mesaj}\n\n"
+        "Yalnizca belge baglamina dayanarak, Turkce ve net bir cevap ver.\n"
+        "ONEMLI - KAYNAK ETIKETLEME KURALI:\n"
+        "Cevabini birden fazla cumleye bol. HER CUMLENIN TAM SONUNA (noktadan sonra), "
+        "o cumledeki bilgiyi hangi [Kaynak N] etiketinden aldiysan [[c:N]] seklinde ekle. "
+        "Ornek: 'Projenin adi X'tir.[[c:1]]' "
+        "Bir cumlede birden fazla kaynak kullandiysan aralarina virgul koyarak yaz: "
+        "'Sistem Y ve Z modullerinden olusur.[[c:1,2]]' "
+        "Sadece yukarida verilen [Kaynak N] numaralarini kullan, baska numara uydurma. "
+        "Kaynak bilgisi olmayan genel/baglayici cumlelere [[c:N]] ekleme."
+    )
+    answer_text = llm.invoke(prompt).content
+
+    cited_ids = set()
+    for m in re.finditer(r"\[\[c:([\d,]+)\]\]", answer_text):
+        for n in m.group(1).split(","):
+            n = n.strip()
+            if n.isdigit():
+                cited_ids.add(int(n))
+
+    citations = {}
+    for idx in cited_ids:
+        info = source_map.get(idx)
+        if info is None:
+            continue
+        page = info.get("page")
+        if page is None or page < 0:
+            continue
+        room_id = info.get("room_id")
+        room = rooms_by_id.get(room_id)
+        image_filename = room.get_image_for_page(page) if room else None
+        # DÜZELTİLMİŞ KOD
+        citations[str(idx)] = {
+            "page": page,
+            "image": image_filename,
+            "text": room.get_page_text(page) or "",  # ← BOŞ STRING GÖNDER
+            # veya
+            "text": room.get_page_text(page) if room else "",
+            "score": info.get("score", 0),
+            "rerank_score": info.get("rerank_score", 0),
+            "room_id": room_id,
+        }
+    print(f"mesaj: {answer_text},                                   citations: {citations}")
+    return {"text": answer_text, "citations": citations}
 
 
 room_manager = RoomManager()

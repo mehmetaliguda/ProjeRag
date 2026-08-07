@@ -1,72 +1,89 @@
-import { useCallback, useRef, useEffect } from 'react'
+'use client'
+
+import { useCallback, useState } from 'react'
 import { useAppStore } from '@/lib/store'
-import { RAGClient, ChatRequest, ChatResponse, UploadResponse } from '@/lib/api-client'
+import { ragClient } from '@/lib/api-client'
+import type { Message } from '@/lib/store'
 
-/**
- * Hook for managing RAG API client with automatic backend URL syncing
- */
-export function useRAGClient() {
-  const { backendUrl } = useAppStore()
-  const clientRef = useRef<RAGClient | null>(null)
+interface UseRagClientOptions {
+  notebookId: string
+  conversationId: string
+}
 
-  // Initialize client on first load and sync URL changes
-  useEffect(() => {
-    if (!clientRef.current) {
-      clientRef.current = new RAGClient(backendUrl)
-    } else {
-      clientRef.current.setBaseURL(backendUrl)
-    }
-  }, [backendUrl])
+interface UseRagClientResult {
+  sendMessage: (query: string) => Promise<void>
+  isSending: boolean
+  error: string | null
+}
 
-  const chat = useCallback(
-    async (request: ChatRequest): Promise<ChatResponse> => {
-      if (!clientRef.current) {
-        throw new Error('RAG client not initialized')
-      }
-      return clientRef.current.chat(request)
-    },
-    []
-  )
-
-  const uploadFile = useCallback(
-    async (file: File): Promise<UploadResponse> => {
-      if (!clientRef.current) {
-        throw new Error('RAG client not initialized')
-      }
-      return clientRef.current.uploadFile(file)
-    },
-    []
-  )
-
-  const deleteDocument = useCallback(
-    async (filename: string): Promise<void> => {
-      if (!clientRef.current) {
-        throw new Error('RAG client not initialized')
-      }
-      return clientRef.current.deleteDocument(filename)
-    },
-    []
-  )
-
-  const getDocuments = useCallback(async () => {
-    if (!clientRef.current) {
-      throw new Error('RAG client not initialized')
-    }
-    return clientRef.current.getDocuments()
-  }, [])
-
-  const resetContext = useCallback(async () => {
-    if (!clientRef.current) {
-      throw new Error('RAG client not initialized')
-    }
-    return clientRef.current.resetContext()
-  }, [])
-
-  return {
-    chat,
-    uploadFile,
-    deleteDocument,
-    getDocuments,
-    resetContext,
+function createId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID()
   }
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+export function useRagClient({ notebookId, conversationId }: UseRagClientOptions): UseRagClientResult {
+  const addMessage = useAppStore((state) => state.addMessage)
+  const [isSending, setIsSending] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const sendMessage = useCallback(
+    async (query: string) => {
+      const trimmed = query.trim()
+      if (!trimmed || !notebookId || !conversationId) return
+
+      setError(null)
+
+      // Optimistically add the user's message.
+      const userMessage: Message = {
+        id: createId(),
+        role: 'user',
+        content: trimmed,
+        timestamp: new Date(),
+      }
+      addMessage(notebookId, conversationId, userMessage)
+
+      // Selected sources for this conversation drive which documents the
+      // backend is allowed to retrieve from.
+      const conversation = useAppStore
+        .getState()
+        .notebooks.find((n) => n.id === notebookId)
+        ?.conversations.find((c) => c.id === conversationId)
+      const documentIds = conversation?.selectedDocumentIds ?? []
+
+      setIsSending(true)
+      try {
+        const response = await ragClient.chat({
+          query: trimmed,
+          documentIds,
+        })
+
+        const assistantMessage: Message = {
+          id: createId(),
+          role: 'assistant',
+          content: response.text,
+          timestamp: new Date(),
+          citations: response.citations,
+        }
+        addMessage(notebookId, conversationId, assistantMessage)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Mesaj gönderilirken bir hata oluştu.'
+        setError(message)
+
+        const errorMessage: Message = {
+          id: createId(),
+          role: 'assistant',
+          content: 'Üzgünüm, bir hata oluştu. Lütfen tekrar deneyin.',
+          timestamp: new Date(),
+        }
+        addMessage(notebookId, conversationId, errorMessage)
+      } finally {
+        setIsSending(false)
+      }
+    },
+    [notebookId, conversationId, addMessage]
+  )
+
+  return { sendMessage, isSending, error }
 }

@@ -53,7 +53,7 @@ export default function NotebooksPage() {
               {notebooks.length} notebook{notebooks.length !== 1 ? 's' : ''}
             </p>
           </div>
-          
+
           {notebooks.length === 0 ? (
             <div className="rounded-lg border-2 border-dashed border-border bg-card p-12 text-center">
               <div className="space-y-2">

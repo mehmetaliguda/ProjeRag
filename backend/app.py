@@ -52,12 +52,17 @@ def upload_room():
         room = room_manager.create_room_from_upload(tmp_path, display_name)
     except Exception as e:
         traceback.print_exc()
+        print(f"Hata tipi: {type(e)}")
+        print(f"Hata mesajı: {str(e)}")
+        import sys
+        print(f"Exception info: {sys.exc_info()}")
         return jsonify({"error": str(e)}), 500
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
 
-    return jsonify({"room": room.to_dict()}), 201
+    # BAŞARI DURUMU — bu kısım eksikti
+    return jsonify({
+        "id": room.room_id,
+        "name": room.display_name,
+    }), 201
 
 
 @app.route('/source-pdf/<room_id>')
@@ -192,12 +197,15 @@ def chat():
         if not data:
             return jsonify({"error": "JSON verisi gonderilmedi"}), 400
 
-        room_id = data.get("room")
         user_input = data.get("soru", "")
         conversation_id = data.get("conversation_id")
 
-        if not room_id:
-            return jsonify({"error": "room alani zorunlu"}), 400
+        room_ids = data.get("rooms")
+        if not room_ids:
+            single = data.get("room")
+            room_ids = [single] if single else []
+        if not room_ids:
+            return jsonify({"error": "room veya rooms alani zorunlu"}), 400
         if not user_input:
             return jsonify({"error": "soru alani bos olamaz"}), 400
 
@@ -207,27 +215,34 @@ def chat():
             if conversation is None:
                 return jsonify({"error": "Conversation bulunamadi"}), 404
 
-        print(f"[FLASK] Oda: {room_id} | Soru: {user_input}")
+        print(f"[FLASK] Oda(lar): {', '.join(room_ids)} | Soru: {user_input}")
 
-        room = room_manager.get_room(room_id)
-        result = room.get_rag_answer(user_input)
+        if len(room_ids) == 1:
+            room = room_manager.get_room(room_ids[0])
+            result = room.get_rag_answer(user_input)
+        else:
+            from rag_chat import get_multi_room_answer
+            result = get_multi_room_answer(room_ids, user_input)
 
         print(f"[FLASK] Result alindi, citations: {len(result.get('citations', {}))} adet")
 
         citations = {}
         for cid, info in (result.get("citations") or {}).items():
+            cite_room_id = info.get("room_id", room_ids[0])
+
             image_url = None
             if info.get("image"):
-                image_url = f"{BASE_URL}/images/{room_id}/{info['image']}"
+                image_url = f"{BASE_URL}/images/{cite_room_id}/{info['image']}"
 
             page = info.get("page")
-            pdf_url = f"{BASE_URL}/source-pdf/{room_id}#page={page + 1}" if page is not None else None
+            pdf_url = f"{BASE_URL}/source-pdf/{cite_room_id}#page={page + 1}" if page is not None else None
 
             citations[cid] = {
                 "page": page,
                 "image": image_url,
                 "text": info.get("text"),
                 "pdf_url": pdf_url,
+                "room_id": cite_room_id,
             }
 
         # conversation_id verildiyse kullanici sorusunu ve asistan cevabini kaydet.
@@ -254,4 +269,4 @@ def chat():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5000, use_reloader=False)
