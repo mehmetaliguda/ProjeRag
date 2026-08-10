@@ -24,7 +24,7 @@ export function ChatHistoryPanel({ notebookId }: ChatHistoryPanelProps) {
   const currentConversationId = useAppStore((state) => state.currentConversationId)
   const createConversation = useAppStore((state) => state.createConversation)
   const setCurrentConversation = useAppStore((state) => state.setCurrentConversation)
-
+  const deleteConversation = useAppStore((state) => state.deleteConversation)
   const conversations = notebook?.conversations ?? []
   const sortedConversations = [...conversations].sort(
     (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
@@ -33,7 +33,11 @@ export function ChatHistoryPanel({ notebookId }: ChatHistoryPanelProps) {
   const handleNewConversation = () => {
     createConversation(notebookId, 'Yeni Sohbet')
   }
-
+  const handleDeleteConversation = async (e: React.MouseEvent, conversationId: string) => {
+    e.stopPropagation()
+    if (!window.confirm('Bu sohbeti silmek istediğinize emin misiniz?')) return
+    await deleteConversation(notebookId, conversationId)
+  }
   return (
     <div className="h-full flex flex-col border-b border-gray-100">
       <div className="flex-shrink-0 p-3 border-b border-gray-100">
@@ -56,10 +60,10 @@ export function ChatHistoryPanel({ notebookId }: ChatHistoryPanelProps) {
             {sortedConversations.map((conversation) => {
               const isActive = conversation.id === currentConversationId
               return (
-                <li key={conversation.id}>
+                <li key={conversation.id} className="group relative">
                   <button
                     onClick={() => setCurrentConversation(notebookId, conversation.id)}
-                    className={`w-full text-left px-3 py-2.5 transition-colors ${
+                    className={`w-full text-left px-3 py-2.5 pr-9 transition-colors ${
                       isActive ? 'bg-blue-50 border-l-2 border-blue-600' : 'hover:bg-gray-50 border-l-2 border-transparent'
                     }`}
                   >
@@ -73,6 +77,14 @@ export function ChatHistoryPanel({ notebookId }: ChatHistoryPanelProps) {
                     <div className="mt-0.5 text-xs text-gray-400">
                       {formatTimestamp(conversation.updatedAt)}
                     </div>
+                  </button>
+                  <button
+                    onClick={(e) => handleDeleteConversation(e, conversation.id)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-gray-400 opacity-0 transition-opacity hover:bg-red-50 hover:text-red-600 group-hover:opacity-100"
+                    aria-label="Sohbeti sil"
+                    title="Sohbeti sil"
+                  >
+                    ✕
                   </button>
                 </li>
               )

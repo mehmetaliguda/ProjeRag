@@ -167,6 +167,17 @@ def create_message(conv_id):
         "timestamp": message.timestamp.isoformat(),
     }), 201
 
+@app.route('/conversations/<int:conv_id>', methods=['DELETE'])
+def delete_conversation(conv_id):
+    conversation = Conversation.query.get(conv_id)
+    if conversation is None:
+        return jsonify({"error": "Conversation bulunamadi"}), 404
+
+    # Message'lar cascade="all, delete-orphan" sayesinde otomatik silinir.
+    db.session.delete(conversation)
+    db.session.commit()
+
+    return jsonify({"status": "success"}), 200
 
 @app.route('/conversations/<int:conv_id>/messages', methods=['GET'])
 def list_messages(conv_id):
@@ -209,11 +220,13 @@ def chat():
         if not user_input:
             return jsonify({"error": "soru alani bos olamaz"}), 400
 
+        # conversation_id opsiyonel: gecersiz/bulunamayan bir id gelirse
+        # sohbeti engellemiyoruz, sadece mesaj kaydini atliyoruz.
         conversation = None
         if conversation_id is not None:
             conversation = Conversation.query.get(conversation_id)
             if conversation is None:
-                return jsonify({"error": "Conversation bulunamadi"}), 404
+                print(f"[FLASK] Uyari: conversation_id={conversation_id} bulunamadi, mesaj kaydi atlanacak")
 
         print(f"[FLASK] Oda(lar): {', '.join(room_ids)} | Soru: {user_input}")
 

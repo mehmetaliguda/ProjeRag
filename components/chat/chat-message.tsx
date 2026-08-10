@@ -28,7 +28,9 @@ export function ChatMessage({ message }: ChatMessageProps) {
       console.log('❌ Text is empty or not a string');
       return [<span key="empty">Metin bulunamadı</span>]
     }
-
+    // [[c:1]]. [[c:2]] [[c:3]] gibi ardışık citation tag'leri arasındaki
+    // noktalama/boşluğu temizle -> [[c:1]][[c:2]][[c:3]]
+    text = text.replace(/\]\]\s*[.,;:]*\s*(?=\[\[c:)/g, ']]')
     const nodes: ReactNode[] = []
     let lastIndex = 0
     let match: RegExpExecArray | null

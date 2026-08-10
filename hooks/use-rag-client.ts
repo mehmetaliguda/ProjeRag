@@ -25,6 +25,7 @@ function createId(): string {
 
 export function useRagClient({ notebookId, conversationId }: UseRagClientOptions): UseRagClientResult {
   const addMessage = useAppStore((state) => state.addMessage)
+  const useServerSync = useAppStore((state) => state.useServerSync)
   const [isSending, setIsSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -53,6 +54,9 @@ export function useRagClient({ notebookId, conversationId }: UseRagClientOptions
       const documentIds = conversation?.selectedDocumentIds ?? []
 
       setIsSending(true)
+      if (useServerSync) {
+        ragClient.setCurrentConversation(conversationId)
+      }
       try {
         const response = await ragClient.chat({
           query: trimmed,
@@ -62,12 +66,17 @@ export function useRagClient({ notebookId, conversationId }: UseRagClientOptions
         const assistantMessage: Message = {
           id: createId(),
           role: 'assistant',
-          content: response.text,
+          content: response.response,
           timestamp: new Date(),
           citations: response.citations,
         }
         addMessage(notebookId, conversationId, assistantMessage)
       } catch (err) {
+        console.error('[useRagClient] sendMessage failed:', {
+          notebookId,
+          conversationId,
+          error: err,
+        })
         const message = err instanceof Error ? err.message : 'Mesaj gönderilirken bir hata oluştu.'
         setError(message)
 
@@ -82,7 +91,7 @@ export function useRagClient({ notebookId, conversationId }: UseRagClientOptions
         setIsSending(false)
       }
     },
-    [notebookId, conversationId, addMessage]
+    [notebookId, conversationId, addMessage, useServerSync]
   )
 
   return { sendMessage, isSending, error }

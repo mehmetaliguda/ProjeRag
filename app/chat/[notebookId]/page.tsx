@@ -9,6 +9,7 @@ import { ChatMessage } from '@/components/chat/chat-message'
 import { CitationPanel } from '@/components/citation-panel'
 import { Button } from '@/components/ui/button'
 import { ArrowLeft, Send } from 'lucide-react'
+import { ThemeSwitcher } from '@/components/theme-switcher'
 
 export default function ChatPage() {
   const router = useRouter()
@@ -22,6 +23,7 @@ export default function ChatPage() {
     currentConversationId,
     createConversation,
     setCurrentConversation,
+    theme,               // ← ekle
   } = useAppStore()
 
   const [input, setInput] = useState('')
@@ -87,6 +89,11 @@ export default function ChatPage() {
         {/* Back Navigation Header */}
         <div className="border-b border-border bg-background/50 px-4 py-3 flex items-center justify-between flex-shrink-0">
           <div className="flex items-center gap-3">
+            <img
+              src={theme === 'light' ? '/icon-light-32x32.png' : '/icon-dark-32x32.png'}
+              alt="Logo"
+              className="h-6 w-6"
+            />
             <Button variant="ghost" size="sm" onClick={handleGoBack} className="gap-2">
               <ArrowLeft className="h-4 w-4" />
               Back to Notebooks
@@ -95,6 +102,7 @@ export default function ChatPage() {
               <span className="text-sm text-muted-foreground">• {currentNotebook.name}</span>
             )}
           </div>
+          <ThemeSwitcher />
         </div>
 
         {/* Mesaj listesi */}

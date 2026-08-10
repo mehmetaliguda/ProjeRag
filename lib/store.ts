@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
 import { ragClient, CitationInfo } from '@/lib/api-client'
+import { applyTheme } from '@/lib/themes'   // dosyanın başına ekle
 
 export type ThemeType = 'light' | 'dark' | 'dust-pink' | 'blue' | 'green' | 'purple'
 
@@ -40,7 +41,6 @@ export interface Conversation {
 }
 
 export interface Notebook {
-  currentConversationId: string
   id: string
   name: string
   documentCount: number
@@ -73,7 +73,7 @@ interface AppStore {
 
   // Conversation actions (within notebooks)
   createConversation: (notebookId: string, title: string) => Promise<string>
-  deleteConversation: (notebookId: string, conversationId: string) => void
+  deleteConversation: (notebookId: string, conversationId: string) => Promise<void>
   setCurrentConversation: (notebookId: string, conversationId: string) => void
   getCurrentConversation: () => Conversation | null
 
@@ -123,7 +123,7 @@ export const useAppStore = create<AppStore>()(
       notebooks: [],
       currentNotebookId: null,
       currentConversationId: null,
-      theme: 'dark',
+      theme: 'light',
       sidebarOpen: true,
       backendUrl: 'http://127.0.0.1:5000',
       hasHydrated: false,
@@ -219,22 +219,30 @@ export const useAppStore = create<AppStore>()(
         return convId
       },
 
-      deleteConversation: (notebookId: string, conversationId: string) => {
-        set((state) => ({
-          notebooks: state.notebooks.map((nb) =>
-            nb.id === notebookId
-              ? {
-                  ...nb,
-                  conversations: nb.conversations.filter((c) => c.id !== conversationId),
-                  updatedAt: new Date(),
-                }
-              : nb
-          ),
-          currentConversationId:
-            state.currentConversationId === conversationId ? null : state.currentConversationId,
-        }))
-      },
-
+      deleteConversation: async (notebookId: string, conversationId: string) => {
+              const { useServerSync } = get()
+      
+              // Sunucu senkronu acikken once backend'den sil; basarisiz olursa
+              // lokal state'e dokunmadan hata firlatilir.
+              if (useServerSync) {
+                await ragClient.deleteConversation(conversationId)
+              }
+            
+              set((state) => ({
+                notebooks: state.notebooks.map((nb) =>
+                  nb.id === notebookId
+                    ? {
+                        ...nb,
+                        conversations: nb.conversations.filter((c) => c.id !== conversationId),
+                        updatedAt: new Date(),
+                      }
+                    : nb
+                ),
+                currentConversationId:
+                  state.currentConversationId === conversationId ? null : state.currentConversationId,
+              }))
+            },
+          
       setCurrentConversation: (notebookId: string, conversationId: string) => {
         set((state) => ({
           currentNotebookId: notebookId,
@@ -308,7 +316,9 @@ export const useAppStore = create<AppStore>()(
       // Document actions (notebook-global — shared across all conversations)
       addDocumentsToNotebook: (notebookId: string, documents: Document[]) => {
         const { currentConversationId } = get()
-
+          if (documents.length > 0) {
+            ragClient.setCurrentRoom(documents[0].id)
+        }
         set((state) => ({
           notebooks: state.notebooks.map((nb) => {
             if (nb.id !== notebookId) return nb
@@ -488,6 +498,7 @@ export const useAppStore = create<AppStore>()(
 
       setTheme: (theme: ThemeType) => {
         set({ theme })
+        applyTheme(theme)
         if (typeof document !== 'undefined') {
           document.documentElement.setAttribute('data-theme', theme)
         }
@@ -579,9 +590,9 @@ export const useAppStore = create<AppStore>()(
       migrate: (persistedState: unknown, version: number) => {
         const state = persistedState as { notebooks?: any[] } & Record<string, unknown>
 
-        if (version >= 2 || !state?.notebooks) {
-          return state as AppStore
-        }
+          if (version >= 2 || !state?.notebooks) {
+            return state as unknown as AppStore
+          }
 
         const notebooks = state.notebooks.map((nb: any) => {
           // Eski conversation'lardaki documents dizilerini id'ye gore dedupe ederek topla
@@ -623,14 +634,15 @@ export const useAppStore = create<AppStore>()(
         backendUrl: state.backendUrl,
         useServerSync: state.useServerSync,
       }),
-      onRehydrateStorage: () => (state) => {
-        state?.setHasHydrated(true)
-        // useServerSync acikken localStorage'dan gelen eski notebook/conversation
-        // verisi varsa kullaniciyi uyar (sunucudaki gercek veriyle uyusmayabilir).
-        if (state?.useServerSync && state.notebooks.length > 0) {
-          state.setUseServerSync(true)
-        }
-      },
+        onRehydrateStorage: () => (state) => {
+          state?.setHasHydrated(true)
+          if (state?.theme) {
+            applyTheme(state.theme)
+          }
+          if (state?.useServerSync && state.notebooks.length > 0) {
+            state.setUseServerSync(true)
+          }
+        },
     }
   )
 )

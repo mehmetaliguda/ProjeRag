@@ -9,11 +9,8 @@ export interface ChatRequest {
 
 export interface ChatResponse {
   response: string
-  sources?: Array<{
-    document: string
-    page?: number
-    excerpt: string
-  }>
+  citations: Record<string, CitationInfo>   // ham şekli koru, dönüştürme
+  status: string                             // eksik olan alan
 }
 
 export interface UploadResponse {
@@ -50,7 +47,7 @@ export interface Room {
 
 // Tek bir citation'ın şekli — store.ts ve UI bileşenleri bunu import eder
 export interface CitationInfo {
-  page: number
+  page: number | null
   image: string | null
   text: string
   pdf_url: string | null
@@ -85,24 +82,22 @@ export class RAGClient {
   // Dönen: { "text": "...", "citations": {...}, "status": "success" }
   async chat(request: ChatRequest): Promise<ChatResponse> {
     try {
-      if (!this.currentRoomId) {
+      const hasDocumentIds = !!request.documentIds && request.documentIds.length > 0
+
+      if (!this.currentRoomId && !hasDocumentIds) {
         throw new Error('Önce bir oda (room) oluşturmalı veya seçmelisiniz!')
       }
 
       const payload: Record<string, unknown> = {
-        room: this.currentRoomId,
+        room: hasDocumentIds ? request.documentIds![0] : this.currentRoomId,
         soru: request.query
       }
 
-      // documentIds doluysa secili room'lari payload'a ekle.
-      // NOT: backend /chat-client endpoint'i su an muhtemelen sadece `room`
-      // alanini okuyor; `rooms` destegi backend'de yoksa coklu-PDF sorgulari
-      // yine sadece ilk dokumani kullanacaktir. Bu bilinen bir sinirlama,
-      // backend guncellenene kadar gecerli.
-      if (request.documentIds && request.documentIds.length > 0) {
-        // Geriye donuk uyumluluk icin ilk secili dokumani `room` olarak da gonder
-        payload.room = request.documentIds[0]
+      // documentIds doluysa selected room'lari payload'a ekle ve currentRoomId'i
+      // de senkron tut, boylece sonraki chat() cagrilarinda tekrar hata alinmaz.
+      if (hasDocumentIds) {
         payload.rooms = request.documentIds
+        this.currentRoomId = request.documentIds![0]
       }
 
       if (this.currentConversationId) {
@@ -110,19 +105,11 @@ export class RAGClient {
       }
 
       const response = await this.client.post<BackendChatResponse>('/chat-client', payload)
-      
-      // Backend yanıtını frontend formatına çevir
-      const sources = Object.entries(response.data.citations || {}).map(([id, citation]) => ({
-        document: citation.text?.substring(0, 50) + '...' || 'Kaynak',
-        page: citation.page !== undefined ? citation.page + 1 : undefined,
-        excerpt: citation.text || '',
-        image_url: citation.image || undefined,
-        pdf_url: citation.pdf_url || undefined
-      }))
 
       return {
         response: response.data.text || 'Yanıt alındı',
-        sources: sources.length > 0 ? sources : undefined
+        citations: response.data.citations || {},
+        status: response.data.status,
       }
     } catch (error) {
       throw this.handleError(error)
@@ -339,6 +326,15 @@ export class RAGClient {
         `/conversations/${conversationId}/messages`
       )
       return response.data
+    } catch (error) {
+      throw this.handleError(error)
+    }
+  }
+
+  // Backend: DELETE /conversations/<conv_id>
+  async deleteConversation(conversationId: string): Promise<void> {
+    try {
+      await this.client.delete(`/conversations/${conversationId}`)
     } catch (error) {
       throw this.handleError(error)
     }
