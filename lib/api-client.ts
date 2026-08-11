@@ -48,7 +48,6 @@ export interface Room {
 // Tek bir citation'ın şekli — store.ts ve UI bileşenleri bunu import eder
 export interface CitationInfo {
   page: number | null
-  image: string | null
   text: string
   pdf_url: string | null
 }
@@ -119,10 +118,11 @@ export class RAGClient {
   // Backend: POST /rooms
   // Beklenen: multipart/form-data ile 'file' alanında PDF
   // Dönen (flat): { "id": "...", "name": "..." }
-  async uploadFile(file: File): Promise<UploadResponse> {
+  async uploadFile(file: File, notebookId: string): Promise<UploadResponse> {
     try {
       const formData = new FormData()
       formData.append('file', file)
+      formData.append('notebook_id', notebookId)
 
       const response = await this.client.post('/rooms', formData, {
         headers: {
@@ -176,10 +176,11 @@ export class RAGClient {
   // Backend: POST /rooms (yeni room oluştur)
   // Beklenen: multipart/form-data ile 'file' alanında PDF
   // Dönen (flat): { "id": "...", "name": "..." }
-  async createRoom(file: File): Promise<Room> {
+async createRoom(file: File, notebookId: string): Promise<Room> {
     try {
       const formData = new FormData()
       formData.append('file', file)
+      formData.append('notebook_id', notebookId)
 
       const response = await this.client.post('/rooms', formData, {
         headers: {
@@ -197,7 +198,7 @@ export class RAGClient {
     } catch (error) {
       throw this.handleError(error)
     }
-  }
+}
 
   // Backend /rooms TEK dosya kabul ediyor; coklu dosya icin bu metod
   // createRoom'u her dosya icin paralel cagirir. Promise.allSettled kullanildigi
@@ -206,8 +207,8 @@ export class RAGClient {
   // calisir; sirali cagrilarda en son basariyla yuklenen room currentRoomId
   // olarak kalir. Bu kabul edilebilir cunku artik chat() hangi room'lari
   // kullanacagini documentIds ile acikca biliyor.
-  async createRooms(files: File[]): Promise<{ succeeded: Room[]; failed: { file: string; error: string }[] }> {
-    const results = await Promise.allSettled(files.map((file) => this.createRoom(file)))
+async createRooms(files: File[], notebookId: string): Promise<{ succeeded: Room[]; failed: { file: string; error: string }[] }> {
+    const results = await Promise.allSettled(files.map((file) => this.createRoom(file, notebookId)))
 
     const succeeded: Room[] = []
     const failed: { file: string; error: string }[] = []
@@ -241,11 +242,6 @@ export class RAGClient {
     return `${this.client.defaults.baseURL}/source-pdf/${roomId}`
   }
 
-  // Backend: GET /images/<room_id>/<filename>
-  async getImageUrl(roomId: string, filename: string): Promise<string> {
-    return `${this.client.defaults.baseURL}/images/${roomId}/${filename}`
-  }
-
   // Mevcut conversation'ı set et
   setCurrentConversation(conversationId: string | null): void {
     this.currentConversationId = conversationId
@@ -259,10 +255,10 @@ export class RAGClient {
   // Backend: POST /notebooks
   // Beklenen: { "name": "..." }
   // Dönen: { "id": "...", "name": "..." }
-  async createNotebook(name: string): Promise<Notebook> {
+async createNotebook(name: string): Promise<Notebook> {
     try {
       const response = await this.client.post<Notebook>('/notebooks', { name })
-      return response.data
+      return { ...response.data, id: String(response.data.id) }
     } catch (error) {
       throw this.handleError(error)
     }
@@ -270,10 +266,10 @@ export class RAGClient {
 
   // Backend: GET /notebooks
   // Dönen: [ { "id": "...", "name": "..." } ]
-  async getNotebooks(): Promise<Notebook[]> {
+async getNotebooks(): Promise<Notebook[]> {
     try {
       const response = await this.client.get<Notebook[]>('/notebooks')
-      return response.data
+      return response.data.map((nb) => ({ ...nb, id: String(nb.id) }))
     } catch (error) {
       throw this.handleError(error)
     }
@@ -282,13 +278,13 @@ export class RAGClient {
   // Backend: POST /notebooks/<nb_id>/conversations
   // Beklenen: { "title": "..." }
   // Dönen: { "id": "...", "title": "..." }
-  async createConversation(notebookId: string, title: string): Promise<Conversation> {
+async createConversation(notebookId: string, title: string): Promise<Conversation> {
     try {
       const response = await this.client.post<Conversation>(
         `/notebooks/${notebookId}/conversations`,
         { title }
       )
-      return response.data
+      return { ...response.data, id: String(response.data.id) }
     } catch (error) {
       throw this.handleError(error)
     }
@@ -296,12 +292,12 @@ export class RAGClient {
 
   // Backend: GET /notebooks/<nb_id>/conversations
   // Dönen: [ { "id": "...", "title": "..." } ]
-  async getConversations(notebookId: string): Promise<Conversation[]> {
+async getConversations(notebookId: string): Promise<Conversation[]> {
     try {
       const response = await this.client.get<Conversation[]>(
         `/notebooks/${notebookId}/conversations`
       )
-      return response.data
+      return response.data.map((c) => ({ ...c, id: String(c.id) }))
     } catch (error) {
       throw this.handleError(error)
     }
@@ -340,7 +336,21 @@ export class RAGClient {
     }
   }
 
-  // Not: Backend'de delete ve reset endpoint'leri yok
+  // Backend: DELETE /rooms/<room_id>
+  async deleteRoom(roomId: string): Promise<void> {
+    try {
+      await this.client.delete(`/rooms/${roomId}`)
+
+      if (this.currentRoomId === roomId) {
+        this.currentRoomId = null
+      }
+    } catch (error) {
+      throw this.handleError(error)
+    }
+  }
+
+  // Not: Backend'de dosya adına göre silme/reset endpoint'i yok; room id
+  // ile silmek için deleteRoom() kullanılmalı.
   async deleteDocument(filename: string): Promise<void> {
     console.warn('Silme işlemi backend tarafından desteklenmiyor:', filename)
     throw new Error('Bu işlevsellik backend\'de bulunmuyor')

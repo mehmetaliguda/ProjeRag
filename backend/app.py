@@ -9,7 +9,7 @@ from werkzeug.utils import secure_filename
 
 from rag_chat import room_manager
 from database import db, init_db
-from models import Notebook, Conversation, Message
+from models import Notebook, Conversation, Message, Room
 
 app = Flask(__name__)
 CORS(app)
@@ -40,6 +40,13 @@ def upload_room():
     if file.filename == '':
         return jsonify({"error": "Dosya secilmedi"}), 400
 
+    notebook_id = request.form.get("notebook_id")
+    if not notebook_id:
+        return jsonify({"error": "notebook_id alani zorunlu"}), 400
+    notebook = Notebook.query.get(notebook_id)
+    if notebook is None:
+        return jsonify({"error": "Notebook bulunamadi"}), 404
+
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXT:
         return jsonify({"error": "Sadece PDF dosyasi yuklenebilir"}), 400
@@ -49,20 +56,25 @@ def upload_room():
     file.save(tmp_path)
 
     try:
-        room = room_manager.create_room_from_upload(tmp_path, display_name)
+        room = room_manager.create_room_from_upload(tmp_path, display_name, notebook_id=notebook.id)
     except Exception as e:
         traceback.print_exc()
-        print(f"Hata tipi: {type(e)}")
-        print(f"Hata mesajı: {str(e)}")
-        import sys
-        print(f"Exception info: {sys.exc_info()}")
         return jsonify({"error": str(e)}), 500
 
-    # BAŞARI DURUMU — bu kısım eksikti
-    return jsonify({
-        "id": room.room_id,
-        "name": room.display_name,
-    }), 201
+    return jsonify({"id": room.room_id, "name": room.display_name}), 201
+
+
+@app.route('/rooms/<room_id>', methods=['DELETE'])
+def delete_room(room_id):
+    try:
+        room_manager.delete_room(room_id)
+    except FileNotFoundError:
+        return jsonify({"error": "Oda bulunamadi"}), 404
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"status": "success"}), 200
 
 
 @app.route('/source-pdf/<room_id>')
@@ -76,13 +88,26 @@ def serve_pdf(room_id):
     return send_from_directory(directory, filename)
 
 
-@app.route('/images/<room_id>/<path:filename>')
-def serve_image(room_id, filename):
-    try:
-        room = room_manager.get_room(room_id)
-    except FileNotFoundError:
-        return jsonify({"error": "Oda bulunamadi"}), 404
-    return send_from_directory(room.image_dir, filename)
+@app.route('/notebooks/<int:nb_id>', methods=['DELETE'])
+def delete_notebook(nb_id):
+    notebook = Notebook.query.get(nb_id)
+    if notebook is None:
+        return jsonify({"error": "Notebook bulunamadi"}), 404
+
+    # Notebook'a bagli tum room'lari RAM + disk + DB'den temizle
+    # (Conversation/Message'lar zaten model relationship'inde
+    # cascade="all, delete-orphan" ile otomatik silinir).
+    room_rows = Room.query.filter_by(notebook_id=nb_id).all()
+    for row in room_rows:
+        try:
+            room_manager.delete_room(row.id)
+        except FileNotFoundError:
+            pass
+
+    db.session.delete(notebook)
+    db.session.commit()
+
+    return jsonify({"status": "success"}), 200
 
 
 # ------------------------------------------------------------------
@@ -243,16 +268,11 @@ def chat():
         for cid, info in (result.get("citations") or {}).items():
             cite_room_id = info.get("room_id", room_ids[0])
 
-            image_url = None
-            if info.get("image"):
-                image_url = f"{BASE_URL}/images/{cite_room_id}/{info['image']}"
-
             page = info.get("page")
             pdf_url = f"{BASE_URL}/source-pdf/{cite_room_id}#page={page + 1}" if page is not None else None
 
             citations[cid] = {
                 "page": page,
-                "image": image_url,
                 "text": info.get("text"),
                 "pdf_url": pdf_url,
                 "room_id": cite_room_id,

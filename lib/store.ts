@@ -83,7 +83,7 @@ interface AppStore {
 
   // Document actions (notebook-global)
   addDocumentsToNotebook: (notebookId: string, documents: Document[]) => void
-  removeDocumentFromNotebook: (notebookId: string, docId: string) => void
+  removeDocumentFromNotebook: (notebookId: string, docId: string) => Promise<void>
   updateDocumentStatus: (notebookId: string, docId: string, status: Document['status']) => void
   getNotebookDocuments: (notebookId: string) => Document[]
 
@@ -127,7 +127,7 @@ export const useAppStore = create<AppStore>()(
       sidebarOpen: true,
       backendUrl: 'http://127.0.0.1:5000',
       hasHydrated: false,
-      useServerSync: false,
+      useServerSync: true,
       syncWarning: null,
       activeCitation: null,
 
@@ -354,7 +354,14 @@ export const useAppStore = create<AppStore>()(
         }))
       },
 
-      removeDocumentFromNotebook: (notebookId: string, docId: string) => {
+      removeDocumentFromNotebook: async (notebookId: string, docId: string) => {
+        const { useServerSync } = get()
+
+        // temp-... placeholder id'leri backend'de hic var olmadi, silme cagrisi atlanir.
+        if (useServerSync && !docId.startsWith('temp-')) {
+          await ragClient.deleteRoom(docId)
+        }
+
         set((state) => ({
           notebooks: state.notebooks.map((nb) =>
             nb.id === notebookId
@@ -634,13 +641,15 @@ export const useAppStore = create<AppStore>()(
         backendUrl: state.backendUrl,
         useServerSync: state.useServerSync,
       }),
-        onRehydrateStorage: () => (state) => {
+                onRehydrateStorage: () => (state) => {
           state?.setHasHydrated(true)
           if (state?.theme) {
             applyTheme(state.theme)
           }
-          if (state?.useServerSync && state.notebooks.length > 0) {
-            state.setUseServerSync(true)
+          if (state?.useServerSync) {
+            state.loadFromServer().catch((err) => {
+              console.error('[store] loadFromServer basarisiz:', err)
+            })
           }
         },
     }

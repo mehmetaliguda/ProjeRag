@@ -52,8 +52,9 @@ class Message(db.Model):
 class Room(db.Model):
     __tablename__ = "rooms"
 
-    id = db.Column(db.String(255), primary_key=True)  # safe_dirname(display_name) slug'i
+    id = db.Column(db.String(255), primary_key=True)
     display_name = db.Column(db.String(255), nullable=False)
     pdf_path = db.Column(db.String(500), nullable=False)
     image_dir = db.Column(db.String(500), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    notebook_id = db.Column(db.Integer, db.ForeignKey("notebooks.id"), nullable=True)

@@ -81,7 +81,7 @@ export function PdfDropzone({ notebookId }: PdfDropzoneProps) {
       ])
 
       // 2. Backend'e paralel yükle.
-      const { succeeded, failed } = await ragClient.createRooms(pdfFiles)
+      const { succeeded, failed } = await ragClient.createRooms(pdfFiles, notebookId)
 
       // 3. Başarılı olanları gerçek room bilgisiyle değiştir.
       succeeded.forEach((room, index) => {

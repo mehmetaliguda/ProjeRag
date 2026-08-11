@@ -1,3 +1,4 @@
+print(">>> HYBRID_RETRIEVER_YENI_KOD_YUKLENDI <<<")
 # hybrid_retriever.py
 """
 Çoklu strateji ile geri getirme modülü
@@ -5,13 +6,12 @@ Semantik + BM25 hibrit yaklaşımı
 """
 
 from typing import List, Dict, Tuple, Any
-import numpy as np
 from collections import defaultdict
 import math
-from langchain_chroma import Chroma
-from langchain_ollama import OllamaEmbeddings, ChatOllama
 import os
 import json
+from langchain_chroma import Chroma
+from langchain_ollama import OllamaEmbeddings, ChatOllama
 
 # dotenv_rag modülünden import et
 from dotenv_rag import load_dotenv, get_env_variable, require_env_variable
@@ -195,9 +195,15 @@ class HybridRetriever:
 
 class CrossEncoderReranker:
     """
-    Cross-encoder ile yeniden sıralama yapar.
-    Not: Bu basit bir implementasyon, gerçek cross-encoder için
-    özel modeller (örn. cross-encoder/ms-marco-MiniLM-L-6-v2) kullanılabilir.
+    LLM tabanli reranker.
+
+    ONEMLI: Butun adaylar TEK bir prompt'ta LLM'e verilir ve 0-10 arasi
+    alakalilik puani JSON olarak istenir. Boylece aday sayisi (N room x k)
+    artsa bile LLM cagri sayisi HEP 1'dir (adaylar icin ayri ayri
+    llm.invoke() cagirmiyoruz).
+
+    LLM cevabi parse edilemezse (bozuk JSON vb.) basit bir kelime-orutusmesi
+    (Jaccard) fallback'ine duser, boylece sistem hicbir zaman coker.
     """
 
     def __init__(self, llm=None):
@@ -213,42 +219,102 @@ class CrossEncoderReranker:
         else:
             self.llm = llm
 
-    def rerank(self, query: str, documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def rerank(self, query: str, documents: List[Dict[str, Any]], min_score: float = 0.0) -> List[Dict[str, Any]]:
         """
         Belgeleri sorgu ile ilgililiklerine göre yeniden sıralar.
+
+        Args:
+            query: Kullanicinin (orijinal) sorusu
+            documents: Puanlanacak aday belge sozlukleri
+            min_score: Bu puanin altinda kalan (alakasiz) adaylar elenir.
+                       0 verilirse hicbir eleme yapilmaz (eski davranis).
         """
         if not documents:
             return []
 
-        scored_docs = []
-        for doc in documents:
-            content = doc.get("content", "")
-            relevance_score = self._calculate_relevance(query, content)
-            doc["rerank_score"] = relevance_score
-            scored_docs.append(doc)
+        scores = self._llm_score(query, documents)
 
-        scored_docs.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
-        return scored_docs
+        if scores is None:
+            print("[CrossEncoderReranker] LLM puanlama basarisiz/parse edilemedi, "
+                  "kelime-ortusmesi fallback'ine donuluyor.")
+            for doc in documents:
+                doc["rerank_score"] = self._fallback_relevance(query, doc.get("content", ""))
+        else:
+            for i, doc in enumerate(documents):
+                raw_score = scores.get(str(i))
+                if raw_score is None:
+                    # LLM bu indekse hic puan dondurmedi -> sessizce 0 verip
+                    # o room'u tamamen elemek yerine kelime-ortusmesi fallback'i kullan.
+                    doc["rerank_score"] = self._fallback_relevance(query, doc.get("content", ""))
+                    continue
+                try:
+                    doc["rerank_score"] = float(raw_score)
+                except (TypeError, ValueError):
+                    doc["rerank_score"] = self._fallback_relevance(query, doc.get("content", ""))
 
-    def _calculate_relevance(self, query: str, content: str) -> float:
-        """
-        Basit bir ilgililik skoru hesaplar.
-        Gelişmiş versiyon cross-encoder model kullanır.
-        """
+        documents.sort(key=lambda d: d.get("rerank_score", 0), reverse=True)
+
+        if min_score > 0:
+            documents = [d for d in documents if d.get("rerank_score", 0) >= min_score]
+
+        return documents
+
+    def _llm_score(self, query: str, documents: List[Dict[str, Any]]):
+        """Tum adaylari tek prompt'ta LLM'e puanlatir. Basarisiz olursa None doner."""
+        listing = "\n\n".join(
+            f"[{i}] {doc.get('content', '')[:600]}" for i, doc in enumerate(documents)
+        )
+        prompt = (
+            "Asagida numarali belge parcalari var. Her birinin, verilen soruyla ne kadar "
+            "alakali oldugunu 0 (tamamen alakasiz) ile 10 (soruyu dogrudan cevapliyor) "
+            "arasinda bir tam sayi ile puanla.\n\n"
+            f"Soru: {query}\n\n"
+            f"Belgeler:\n{listing}\n\n"
+            "SADECE gecerli bir JSON nesnesi don, aciklama/baslik/markdown ekleme. "
+            'Format ornegi: {"0": 7, "1": 2, "2": 9}'
+        )
+
+        try:
+            raw = self.llm.invoke(prompt).content.strip()
+            # Model bazen ```json ... ``` gibi sarabiliyor, temizle.
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:].strip()
+            # json.loads TUM string'in tek bir JSON olmasini bekler; model
+            # JSON'dan SONRA fazladan aciklama/bos satir eklerse
+            # "Extra data" hatasi verip fallback'e dusuruyordu. raw_decode
+            # ise string'in BASINDAKI ilk gecerli JSON degerini alir,
+            # arkasindaki fazlaligi yok sayar.
+            obj, _ = json.JSONDecoder().raw_decode(raw)
+            expected = set(str(i) for i in range(len(documents)))
+            missing = expected - set(obj.keys())
+            if missing:
+                missing_rooms = [documents[int(i)].get("room_id", "?") for i in missing]
+                print(f"[CrossEncoderReranker] UYARI: LLM {len(missing)}/{len(documents)} "
+                      f"indeks icin puan donmedi (indeksler={sorted(missing, key=int)}, "
+                      f"room_id'ler={missing_rooms}). Bu indeksler icin fallback kullanilacak.")
+            print(f"[CrossEncoderReranker] Ham skorlar: {obj}")
+            return obj
+        except Exception as e:
+            print(f"[CrossEncoderReranker] LLM rerank hatasi: {e}")
+            return None
+
+    @staticmethod
+    def _fallback_relevance(query: str, content: str) -> float:
+        """Basit kelime-ortusmesi skoru (0-10 araligina olceklenmis). Sadece
+        LLM puanlama basarisiz oldugunda kullanilir."""
         query_words = set(query.lower().split())
         content_words = set(content.lower().split())
+        if not query_words:
+            return 0.0
 
         intersection = query_words.intersection(content_words)
-        if not query_words:
-            return 0
-
         jaccard = len(intersection) / len(query_words.union(content_words))
 
         word_weights = {}
         for word in query_words:
             if word in content.lower():
-                word_weights[word] = content.lower().count(word) / len(content.split())
-
+                word_weights[word] = content.lower().count(word) / max(len(content.split()), 1)
         weight_score = sum(word_weights.values()) / len(query_words) if query_words else 0
 
-        return (jaccard * 0.6 + weight_score * 0.4)
+        return round((jaccard * 0.6 + weight_score * 0.4) * 10, 2)
