@@ -106,10 +106,26 @@ def safe_dirname(name: str) -> str:
 # (hem tek-room _generate hem de get_multi_room_answer bunu kullanir,
 # ayrik kopyalar prompt degisince birbirinden kopmasin diye).
 # ------------------------------------------------------------------
-def _build_citation_prompt(context: str, question: str, history: str = "") -> str:
+def _build_citation_prompt(context: str, question: str, history: str = "", multi_source: bool = False) -> str:
     history_block = f"Gecmis konusma:\n{history}\n\n" if history else ""
+    # Birden fazla PDF/room'dan gelen baglam varsa, modelin tek kaynaga
+    # (ozellikle ilk/en baskin olana) daralmasini engellemek icin ek bir
+    # talimat blogu ekleniyor. CoT/kaynak-etiketleme yapisi degismiyor,
+    # sadece bu blok "Belge baglami" bolumunden once ekleniyor.
+    synthesis_block = ""
+    if multi_source:
+        synthesis_block = (
+            "ONEMLI - COKLU KAYNAK SENTEZI KURALI:\n"
+            "Asagidaki belge baglaminda birden fazla farkli PDF/kaynaktan gelen bilgi var. "
+            "Cevabini SADECE en baskin, en uzun veya ilk siradaki kaynaga dayandirma. "
+            "Farkli kaynaklardaki ilgili bilgileri birbiriyle iliskilendirerek TEK ve "
+            "butuncul bir cevap olustur; konuyla ilgisi olan her kaynaktan faydalan. "
+            "Kaynaklar birbirini tamamliyorsa bunu birlikte anlat, birbiriyle celisiyorsa "
+            "bu farki acikca belirt.\n\n"
+        )
     return (
         f"{history_block}"
+        f"{synthesis_block}"
         f"Belge baglami:\n{context}\n\n"
         f"Soru: {question}\n\n"
         "Yalnizca belge baglamina dayanarak, Turkce ve net bir cevap ver.\n"
@@ -629,11 +645,14 @@ def get_multi_room_answer(room_ids: List[str], mesaj: str) -> dict:
         return {"text": "Belgede bu soruyla ilgili yeterli bilgi bulamadim.", "citations": {}}
 
     context = "\n\n".join(
-        f"[Kaynak {idx}] ({rooms_by_id[room_id].display_name}, Sayfa {page}):\n{doc.page_content}"
+        f"[Kaynak {idx}] (Belge: {rooms_by_id[room_id].display_name}, Sayfa {page}):\n{doc.page_content}"
         for idx, page, room_id, doc in numbered_docs
     )
 
-    prompt = _build_citation_prompt(context, mesaj)
+    # Cevapta gercekten kullanilan aday kumesi (numbered_docs) birden fazla
+    # farkli room'a yayiliyorsa modele coklu-kaynak sentez talimati verilir.
+    distinct_source_rooms = {room_id for _, _, room_id, _ in numbered_docs}
+    prompt = _build_citation_prompt(context, mesaj, multi_source=len(distinct_source_rooms) > 1)
     answer_text = llm.invoke(prompt).content
 
     cited_ids = _parse_cited_ids(answer_text)

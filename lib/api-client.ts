@@ -29,6 +29,7 @@ export interface Notebook {
 export interface Conversation {
   id: string
   title: string
+  selected_room_ids?: string[]
 }
 
 // Backend: /conversations/<conv_id>/messages
@@ -43,6 +44,9 @@ export interface ConversationMessage {
 export interface Room {
   id: string
   name: string
+  notebook_id?: string
+  document_count?: number
+  created_at?: string
 }
 
 // Tek bir citation'ın şekli — store.ts ve UI bileşenleri bunu import eder
@@ -168,6 +172,32 @@ export class RAGClient {
     try {
       const response = await this.client.get('/rooms')
       return response.data.rooms || []
+    } catch (error) {
+      throw this.handleError(error)
+    }
+  }
+
+  // Backend: GET /notebooks/<nb_id>/rooms
+  // Dönen: { "rooms": [ { "id", "name", "notebook_id", "document_count"?, "created_at" } ] }
+  // (veya doğrudan dizi olarak dönerse de destekleniyor)
+  async getNotebookRooms(notebookId: string): Promise<Room[]> {
+    try {
+      const response = await this.client.get(`/notebooks/${notebookId}/rooms`)
+      const data = response.data
+      return Array.isArray(data) ? data : (data?.rooms || [])
+    } catch (error) {
+      throw this.handleError(error)
+    }
+  }
+
+  // Backend: PATCH /conversations/<conv_id>
+  // Beklenen: { "selected_room_ids": [...] }
+  // Sadece bu alani gunceller.
+  async updateConversationSelectedRooms(conversationId: string, roomIds: string[]): Promise<void> {
+    try {
+      await this.client.patch(`/conversations/${conversationId}`, {
+        selected_room_ids: roomIds,
+      })
     } catch (error) {
       throw this.handleError(error)
     }

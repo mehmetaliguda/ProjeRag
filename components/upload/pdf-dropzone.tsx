@@ -97,10 +97,19 @@ export function PdfDropzone({ notebookId }: PdfDropzoneProps) {
           matchIndex !== -1 ? placeholders[matchIndex] : placeholders[index]
         if (!placeholder) return
 
+        // matchIndex placeholders ile ayni sirada olan pdfFiles'a da karsilik gelir,
+        // bu yuzden gercek dosya boyutunu oradan alabiliyoruz.
+        const matchedFile = matchIndex !== -1 ? pdfFiles[matchIndex] : pdfFiles[index]
+
         removeDocumentFromNotebook(notebookId, placeholder.id)
         addDocumentsToNotebook(notebookId, [
           {
-            ...(room as unknown as Document),
+            id: (room as any).id,
+            name: (room as any).name,
+            size: matchedFile?.size ?? 0,
+            uploadedAt: (room as any).created_at
+              ? new Date((room as any).created_at)
+              : new Date(),
             status: 'ready',
           },
         ])

@@ -117,6 +117,32 @@ interface AppStore {
 // tarih string'lerini geri okurken otomatik olarak Date nesnesine ceviriyoruz.
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
 
+// Room secimi degistiginde her tikta backend'e istek atmamak icin conversation
+// basina debounce edilir. PATCH /conversations/<id> cagrisi son degisiklikten
+// SELECTION_SYNC_DEBOUNCE_MS sonra, en guncel selectedDocumentIds ile atilir.
+const SELECTION_SYNC_DEBOUNCE_MS = 800
+const selectionSyncTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+function scheduleSelectedRoomsSync(
+  conversationId: string,
+  selectedRoomIds: string[],
+  useServerSync: boolean
+) {
+  if (!useServerSync) return
+
+  const existing = selectionSyncTimers.get(conversationId)
+  if (existing) clearTimeout(existing)
+
+  const timer = setTimeout(() => {
+    selectionSyncTimers.delete(conversationId)
+    ragClient.updateConversationSelectedRooms(conversationId, selectedRoomIds).catch((err) => {
+      console.error('[store] selected_room_ids senkron hatasi:', err)
+    })
+  }, SELECTION_SYNC_DEBOUNCE_MS)
+
+  selectionSyncTimers.set(conversationId, timer)
+}
+
 export const useAppStore = create<AppStore>()(
   persist(
     (set, get) => ({
@@ -445,6 +471,14 @@ export const useAppStore = create<AppStore>()(
               : nb
           ),
         }))
+
+        const { useServerSync, notebooks } = get()
+        const updatedSelection = notebooks
+          .find((nb) => nb.id === notebookId)
+          ?.conversations.find((c) => c.id === conversationId)?.selectedDocumentIds
+        if (updatedSelection) {
+          scheduleSelectedRoomsSync(conversationId, updatedSelection, useServerSync)
+        }
       },
 
       selectAllDocuments: (notebookId: string, conversationId: string) => {
@@ -467,6 +501,14 @@ export const useAppStore = create<AppStore>()(
               : nb
           ),
         }))
+
+        const { useServerSync, notebooks } = get()
+        const updatedSelection = notebooks
+          .find((nb) => nb.id === notebookId)
+          ?.conversations.find((c) => c.id === conversationId)?.selectedDocumentIds
+        if (updatedSelection) {
+          scheduleSelectedRoomsSync(conversationId, updatedSelection, useServerSync)
+        }
       },
 
       clearDocumentSelection: (notebookId: string, conversationId: string) => {
@@ -489,6 +531,9 @@ export const useAppStore = create<AppStore>()(
               : nb
           ),
         }))
+
+        const { useServerSync } = get()
+        scheduleSelectedRoomsSync(conversationId, [], useServerSync)
       },
 
       getSelectedDocuments: (notebookId: string, conversationId: string) => {
@@ -540,20 +585,34 @@ export const useAppStore = create<AppStore>()(
       clearSyncWarning: () => set({ syncWarning: null }),
 
       loadFromServer: async () => {
-        // GET /notebooks -> [{id, name}], sonra her notebook icin
-        // GET /notebooks/<nb_id>/conversations -> [{id, title}]
+        // GET /notebooks -> [{id, name}], sonra her notebook icin paralel olarak:
+        // - GET /notebooks/<nb_id>/conversations -> [{id, title, selected_room_ids?}]
+        // - GET /notebooks/<nb_id>/rooms -> [{id, name, notebook_id, document_count?, created_at?}]
         // Not: mesajlar bu adimda cekilmiyor (gorev kapsaminda yok), bu yuzden
-        // sunucudan gelen conversation'lar bos messages/documents ile baslar.
+        // sunucudan gelen conversation'lar bos messages ile baslar.
         const serverNotebooks = await ragClient.getNotebooks()
 
         const notebooks: Notebook[] = await Promise.all(
           serverNotebooks.map(async (nb) => {
-            const serverConversations = await ragClient.getConversations(nb.id)
+            const [serverConversations, serverRooms] = await Promise.all([
+              ragClient.getConversations(nb.id),
+              ragClient.getNotebookRooms(nb.id),
+            ])
+
+            const documents: Document[] = serverRooms.map((room) => ({
+              id: room.id,
+              name: room.name,
+              size: 0, // backend size döndürmüyor
+              uploadedAt: room.created_at ? new Date(room.created_at) : new Date(),
+              status: 'ready',
+            }))
+
             const conversations: Conversation[] = serverConversations.map((c) => ({
               id: c.id,
               title: c.title,
               messages: [],
-              selectedDocumentIds: [],
+              // backend'den gelen secili room id'leri; alan yoksa/eksikse bos dizi
+              selectedDocumentIds: c.selected_room_ids || [],
               createdAt: new Date(),
               updatedAt: new Date(),
             }))
@@ -561,8 +620,8 @@ export const useAppStore = create<AppStore>()(
             return {
               id: nb.id,
               name: nb.name,
-              documentCount: 0,
-              documents: [],
+              documentCount: documents.length,
+              documents,
               conversations,
               mssqlConfig: null,
               createdAt: new Date(),

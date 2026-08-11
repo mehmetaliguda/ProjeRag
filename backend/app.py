@@ -28,7 +28,42 @@ BASE_URL = os.getenv("APP_BASE_URL", "http://sunucuIP:5000")
 # ------------------------------------------------------------------
 @app.route('/rooms', methods=['GET'])
 def list_rooms():
-    return jsonify({"rooms": room_manager.list_rooms()})
+    rooms = room_manager.list_rooms()
+    # room_manager RAM'deki oda listesini dondurur, notebook_id icermez.
+    # DB'deki Room satirlariyla id uzerinden eslestirip zenginlestiriyoruz;
+    # geriye donuk kirilma olmasin diye mevcut alanlar oldugu gibi kaliyor.
+    notebook_ids_by_room = {
+        row.id: row.notebook_id for row in Room.query.all()
+    }
+    for room in rooms:
+        room_id = room.get("id")
+        room["notebook_id"] = notebook_ids_by_room.get(room_id)
+    return jsonify({"rooms": rooms})
+
+
+@app.route('/notebooks/<int:nb_id>/rooms', methods=['GET'])
+def list_notebook_rooms(nb_id):
+    notebook = Notebook.query.get(nb_id)
+    if notebook is None:
+        return jsonify({"error": "Notebook bulunamadi"}), 404
+
+    rows = Room.query.filter_by(notebook_id=nb_id).order_by(Room.created_at).all()
+    rooms = []
+    for row in rows:
+        document_count = None
+        try:
+            document_count = room_manager.get_room(row.id).document_count
+        except (FileNotFoundError, AttributeError):
+            pass
+        rooms.append({
+            "id": row.id,
+            "name": row.display_name,
+            "notebook_id": row.notebook_id,
+            "document_count": document_count,
+            "created_at": row.created_at.isoformat(),
+        })
+
+    return jsonify({"rooms": rooms})
 
 
 @app.route('/rooms', methods=['POST'])
@@ -147,11 +182,13 @@ def create_conversation(nb_id):
     if not title:
         return jsonify({"error": "title alani zorunlu"}), 400
 
-    conversation = Conversation(notebook_id=nb_id, title=title)
+    selected_room_ids = data.get("selected_room_ids") or []
+
+    conversation = Conversation(notebook_id=nb_id, title=title, selected_room_ids=selected_room_ids)
     db.session.add(conversation)
     db.session.commit()
 
-    return jsonify({"id": conversation.id, "title": conversation.title}), 201
+    return jsonify(conversation.to_dict()), 201
 
 
 @app.route('/notebooks/<int:nb_id>/conversations', methods=['GET'])
@@ -161,7 +198,36 @@ def list_conversations(nb_id):
         return jsonify({"error": "Notebook bulunamadi"}), 404
 
     conversations = Conversation.query.filter_by(notebook_id=nb_id).order_by(Conversation.created_at).all()
-    return jsonify([{"id": c.id, "title": c.title} for c in conversations])
+    return jsonify([c.to_dict() for c in conversations])
+
+
+@app.route('/conversations/<int:conv_id>', methods=['PATCH'])
+def update_conversation(conv_id):
+    conversation = Conversation.query.get(conv_id)
+    if conversation is None:
+        return jsonify({"error": "Conversation bulunamadi"}), 404
+
+    data = request.get_json(silent=True) or {}
+    if "selected_room_ids" not in data:
+        return jsonify({"error": "selected_room_ids alani zorunlu"}), 400
+
+    selected_room_ids = data.get("selected_room_ids")
+    if not isinstance(selected_room_ids, list):
+        return jsonify({"error": "selected_room_ids bir liste olmali"}), 400
+
+    conversation.selected_room_ids = selected_room_ids
+    db.session.commit()
+
+    return jsonify(conversation.to_dict()), 200
+
+
+@app.route('/conversations/<int:conv_id>', methods=['GET'])
+def get_conversation(conv_id):
+    conversation = Conversation.query.get(conv_id)
+    if conversation is None:
+        return jsonify({"error": "Conversation bulunamadi"}), 404
+
+    return jsonify(conversation.to_dict())
 
 
 # ------------------------------------------------------------------
