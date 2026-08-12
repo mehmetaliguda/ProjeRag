@@ -475,7 +475,18 @@ class RoomManager:
 
         notebook_id = row.notebook_id if row is not None else getattr(self._rooms.get(room_id), "notebook_id", None)
 
-        self._rooms.pop(room_id, None)
+        room = self._rooms.pop(room_id, None)
+
+        # Chroma'nin sqlite dosyasini acik tutan client'i kapatmadan
+        # rmtree denemek dosyayi kilitli birakip sessizce basarisiz oluyordu.
+        if room is not None and hasattr(room, "vectorstore"):
+            try:
+                room.vectorstore._client._system.stop()  # chroma client'i kapat
+            except Exception as e:
+                print(f"[delete_room] chroma client kapatilamadi: {e}")
+        del room
+        import gc
+        gc.collect()
 
         room_dir = (
             os.path.join(ROOMS_ROOT, str(notebook_id), room_id)
@@ -483,7 +494,11 @@ class RoomManager:
             else os.path.join(ROOMS_ROOT, room_id)
         )
         if os.path.isdir(room_dir):
-            shutil.rmtree(room_dir, ignore_errors=True)
+            try:
+                shutil.rmtree(room_dir)
+            except Exception as e:
+                print(f"[delete_room] KLASOR SILINEMEDI: {room_dir} -> {e}")
+                raise  # frontend'e 500 dönsün, sessizce yutmayalim
 
         if row is not None:
             db.session.delete(row)

@@ -185,7 +185,13 @@ export const useAppStore = create<AppStore>()(
         return id
       },
 
-      deleteNotebook: (id: string) => {
+      deleteNotebook: async (id: string) => {
+        const { useServerSync } = get()
+
+        if (useServerSync) {
+          await ragClient.deleteNotebook(id)
+        }
+
         set((state) => ({
           notebooks: state.notebooks.filter((nb) => nb.id !== id),
           currentNotebookId:
@@ -195,7 +201,6 @@ export const useAppStore = create<AppStore>()(
           currentConversationId: state.currentNotebookId === id ? null : state.currentConversationId,
         }))
       },
-
       renameNotebook: (id: string, name: string) => {
         set((state) => ({
           notebooks: state.notebooks.map((nb) =>
@@ -584,59 +589,68 @@ export const useAppStore = create<AppStore>()(
 
       clearSyncWarning: () => set({ syncWarning: null }),
 
-      loadFromServer: async () => {
-        // GET /notebooks -> [{id, name}], sonra her notebook icin paralel olarak:
-        // - GET /notebooks/<nb_id>/conversations -> [{id, title, selected_room_ids?}]
-        // - GET /notebooks/<nb_id>/rooms -> [{id, name, notebook_id, document_count?, created_at?}]
-        // Not: mesajlar bu adimda cekilmiyor (gorev kapsaminda yok), bu yuzden
-        // sunucudan gelen conversation'lar bos messages ile baslar.
-        const serverNotebooks = await ragClient.getNotebooks()
+loadFromServer: async () => {
+  const serverNotebooks = await ragClient.getNotebooks()
 
-        const notebooks: Notebook[] = await Promise.all(
-          serverNotebooks.map(async (nb) => {
-            const [serverConversations, serverRooms] = await Promise.all([
-              ragClient.getConversations(nb.id),
-              ragClient.getNotebookRooms(nb.id),
-            ])
+  const notebooks: Notebook[] = await Promise.all(
+    serverNotebooks.map(async (nb) => {
+      try {
+        const [serverConversations, serverRooms] = await Promise.all([
+          ragClient.getConversations(nb.id),
+          ragClient.getNotebookRooms(nb.id),
+        ])
 
-            const documents: Document[] = serverRooms.map((room) => ({
-              id: room.id,
-              name: room.name,
-              size: 0, // backend size döndürmüyor
-              uploadedAt: room.created_at ? new Date(room.created_at) : new Date(),
-              status: 'ready',
-            }))
+        const documents: Document[] = serverRooms.map((room) => ({
+          id: room.id,
+          name: room.name,
+          size: 0,
+          uploadedAt: room.created_at ? new Date(room.created_at) : new Date(),
+          status: 'ready',
+        }))
 
-            const conversations: Conversation[] = serverConversations.map((c) => ({
-              id: c.id,
-              title: c.title,
-              messages: [],
-              // backend'den gelen secili room id'leri; alan yoksa/eksikse bos dizi
-              selectedDocumentIds: c.selected_room_ids || [],
-              createdAt: new Date(),
-              updatedAt: new Date(),
-            }))
+        const conversations: Conversation[] = serverConversations.map((c) => ({
+          id: c.id,
+          title: c.title,
+          messages: [],
+          selectedDocumentIds: c.selected_room_ids || [],
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }))
 
-            return {
-              id: nb.id,
-              name: nb.name,
-              documentCount: documents.length,
-              documents,
-              conversations,
-              mssqlConfig: null,
-              createdAt: new Date(),
-              updatedAt: new Date(),
-            }
-          })
-        )
+        return {
+          id: nb.id,
+          name: nb.name,
+          documentCount: documents.length,
+          documents,
+          conversations,
+          mssqlConfig: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }
+      } catch (err) {
+        console.error(`[store] notebook ${nb.id} yuklenemedi:`, err)
+        set({ syncWarning: `Bazi notebook verileri yuklenemedi (id: ${nb.id})` })
+        return {
+          id: nb.id,
+          name: nb.name,
+          documentCount: 0,
+          documents: [],
+          conversations: [],
+          mssqlConfig: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }
+      }
+    })
+  )
 
-        set({
-          notebooks,
-          currentNotebookId: null,
-          currentConversationId: null,
-          syncWarning: null,
-        })
-      },
+  set({
+    notebooks,
+    currentNotebookId: null,
+    currentConversationId: null,
+    syncWarning: null,
+  })
+},
     }),
     {
       name: 'rag-notebook-storage',

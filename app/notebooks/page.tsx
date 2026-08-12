@@ -50,7 +50,7 @@ export default function NotebooksPage() {
           <div className="space-y-2 mb-6">
             <h2 className="text-xl font-semibold">Notebooks</h2>
             <p className="text-sm text-muted-foreground">
-              {notebooks.length} notebook{notebooks.length !== 1 ? 's' : ''}
+              {notebooks.filter(Boolean).length} notebook{notebooks.filter(Boolean).length !== 1 ? 's' : ''}
             </p>
           </div>
 
@@ -67,13 +67,15 @@ export default function NotebooksPage() {
             </div>
           ) : (
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
-              {notebooks.map((notebook) => (
-                <NotebookCard
-                  key={notebook.id}
-                  notebook={notebook}
-                  onOpen={() => handleOpenNotebook(notebook.id)}
-                />
-              ))}
+              {notebooks
+                .filter((notebook): notebook is NonNullable<typeof notebook> => notebook != null)
+                .map((notebook) => (
+                  <NotebookCard
+                    key={notebook.id}
+                    notebook={notebook}
+                    onOpen={() => handleOpenNotebook(notebook.id)}
+                  />
+                ))}
             </div>
           )}
         </section>

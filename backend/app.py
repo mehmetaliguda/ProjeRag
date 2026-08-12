@@ -7,7 +7,9 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
+import shutil
 from rag_chat import room_manager
+import rag_chat  # room_manager zaten import ediliyor ama ROOMS_ROOT icin modulun kendisi lazim
 from database import db, init_db
 from models import Notebook, Conversation, Message, Room
 
@@ -123,26 +125,7 @@ def serve_pdf(room_id):
     return send_from_directory(directory, filename)
 
 
-@app.route('/notebooks/<int:nb_id>', methods=['DELETE'])
-def delete_notebook(nb_id):
-    notebook = Notebook.query.get(nb_id)
-    if notebook is None:
-        return jsonify({"error": "Notebook bulunamadi"}), 404
 
-    # Notebook'a bagli tum room'lari RAM + disk + DB'den temizle
-    # (Conversation/Message'lar zaten model relationship'inde
-    # cascade="all, delete-orphan" ile otomatik silinir).
-    room_rows = Room.query.filter_by(notebook_id=nb_id).all()
-    for row in room_rows:
-        try:
-            room_manager.delete_room(row.id)
-        except FileNotFoundError:
-            pass
-
-    db.session.delete(notebook)
-    db.session.commit()
-
-    return jsonify({"status": "success"}), 200
 
 
 # ------------------------------------------------------------------
@@ -150,22 +133,59 @@ def delete_notebook(nb_id):
 # ------------------------------------------------------------------
 @app.route('/notebooks', methods=['POST'])
 def create_notebook():
-    data = request.get_json(silent=True) or {}
-    name = data.get("name")
-    if not name:
-        return jsonify({"error": "name alani zorunlu"}), 400
+    try:
+        data = request.get_json(silent=True) or {}
+        name = data.get("name")
+        if not name:
+            return jsonify({"error": "name alani zorunlu"}), 400
 
-    notebook = Notebook(name=name)
-    db.session.add(notebook)
+        notebook = Notebook(name=name)
+        db.session.add(notebook)
+        db.session.commit()
+
+        return jsonify({"id": notebook.id, "name": notebook.name}), 201
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e), "status": "error", "traceback": traceback.format_exc()}), 500
+
+@app.route('/notebooks/<int:nb_id>', methods=['DELETE'])
+def delete_notebook(nb_id):
+    notebook = Notebook.query.get(nb_id)
+    if notebook is None:
+        return jsonify({"error": "Notebook bulunamadi"}), 404
+
+    room_rows = Room.query.filter_by(notebook_id=nb_id).all()
+    for row in room_rows:
+        try:
+            room_manager.delete_room(row.id)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"error": f"Room silinemedi ({row.id}): {e}"}), 500
+
+    db.session.delete(notebook)
     db.session.commit()
 
-    return jsonify({"id": notebook.id, "name": notebook.name}), 201
+    # Notebook'a ait ust klasor (rag_rooms/<notebook_id>/) rooms silindikten
+    # sonra bos kalir ama kendisi silinmez - onu da temizle.
+    notebook_dir = os.path.join(rag_chat.ROOMS_ROOT, str(nb_id))
+    if os.path.isdir(notebook_dir):
+        shutil.rmtree(notebook_dir)
+
+    print(f"[delete_notebook] notebook {nb_id} silindi ({len(room_rows)} room ile birlikte)")
+
+    return jsonify({"status": "success"}), 200
 
 
 @app.route('/notebooks', methods=['GET'])
 def list_notebooks():
-    notebooks = Notebook.query.order_by(Notebook.created_at).all()
-    return jsonify([{"id": nb.id, "name": nb.name} for nb in notebooks])
+    try:
+        notebooks = Notebook.query.order_by(Notebook.created_at).all()
+        return jsonify([{"id": nb.id, "name": nb.name} for nb in notebooks])
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e), "status": "error", "traceback": traceback.format_exc()}), 500
 
 
 # ------------------------------------------------------------------
@@ -173,61 +193,77 @@ def list_notebooks():
 # ------------------------------------------------------------------
 @app.route('/notebooks/<int:nb_id>/conversations', methods=['POST'])
 def create_conversation(nb_id):
-    notebook = Notebook.query.get(nb_id)
-    if notebook is None:
-        return jsonify({"error": "Notebook bulunamadi"}), 404
+    try:
+        notebook = Notebook.query.get(nb_id)
+        if notebook is None:
+            return jsonify({"error": "Notebook bulunamadi"}), 404
 
-    data = request.get_json(silent=True) or {}
-    title = data.get("title")
-    if not title:
-        return jsonify({"error": "title alani zorunlu"}), 400
+        data = request.get_json(silent=True) or {}
+        title = data.get("title")
+        if not title:
+            return jsonify({"error": "title alani zorunlu"}), 400
 
-    selected_room_ids = data.get("selected_room_ids") or []
+        selected_room_ids = data.get("selected_room_ids") or []
 
-    conversation = Conversation(notebook_id=nb_id, title=title, selected_room_ids=selected_room_ids)
-    db.session.add(conversation)
-    db.session.commit()
+        conversation = Conversation(notebook_id=nb_id, title=title, selected_room_ids=selected_room_ids)
+        db.session.add(conversation)
+        db.session.commit()
 
-    return jsonify(conversation.to_dict()), 201
+        return jsonify(conversation.to_dict()), 201
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e), "status": "error", "traceback": traceback.format_exc()}), 500
 
 
 @app.route('/notebooks/<int:nb_id>/conversations', methods=['GET'])
 def list_conversations(nb_id):
-    notebook = Notebook.query.get(nb_id)
-    if notebook is None:
-        return jsonify({"error": "Notebook bulunamadi"}), 404
+    try:
+        notebook = Notebook.query.get(nb_id)
+        if notebook is None:
+            return jsonify({"error": "Notebook bulunamadi"}), 404
 
-    conversations = Conversation.query.filter_by(notebook_id=nb_id).order_by(Conversation.created_at).all()
-    return jsonify([c.to_dict() for c in conversations])
+        conversations = Conversation.query.filter_by(notebook_id=nb_id).order_by(Conversation.created_at).all()
+        return jsonify([c.to_dict() for c in conversations])
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e), "status": "error", "traceback": traceback.format_exc()}), 500
 
 
 @app.route('/conversations/<int:conv_id>', methods=['PATCH'])
 def update_conversation(conv_id):
-    conversation = Conversation.query.get(conv_id)
-    if conversation is None:
-        return jsonify({"error": "Conversation bulunamadi"}), 404
+    try:
+        conversation = Conversation.query.get(conv_id)
+        if conversation is None:
+            return jsonify({"error": "Conversation bulunamadi"}), 404
 
-    data = request.get_json(silent=True) or {}
-    if "selected_room_ids" not in data:
-        return jsonify({"error": "selected_room_ids alani zorunlu"}), 400
+        data = request.get_json(silent=True) or {}
+        if "selected_room_ids" not in data:
+            return jsonify({"error": "selected_room_ids alani zorunlu"}), 400
 
-    selected_room_ids = data.get("selected_room_ids")
-    if not isinstance(selected_room_ids, list):
-        return jsonify({"error": "selected_room_ids bir liste olmali"}), 400
+        selected_room_ids = data.get("selected_room_ids")
+        if not isinstance(selected_room_ids, list):
+            return jsonify({"error": "selected_room_ids bir liste olmali"}), 400
 
-    conversation.selected_room_ids = selected_room_ids
-    db.session.commit()
+        conversation.selected_room_ids = selected_room_ids
+        db.session.commit()
 
-    return jsonify(conversation.to_dict()), 200
+        return jsonify(conversation.to_dict()), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e), "status": "error", "traceback": traceback.format_exc()}), 500
 
 
 @app.route('/conversations/<int:conv_id>', methods=['GET'])
 def get_conversation(conv_id):
-    conversation = Conversation.query.get(conv_id)
-    if conversation is None:
-        return jsonify({"error": "Conversation bulunamadi"}), 404
+    try:
+        conversation = Conversation.query.get(conv_id)
+        if conversation is None:
+            return jsonify({"error": "Conversation bulunamadi"}), 404
 
-    return jsonify(conversation.to_dict())
+        return jsonify(conversation.to_dict())
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e), "status": "error", "traceback": traceback.format_exc()}), 500
 
 
 # ------------------------------------------------------------------
@@ -235,57 +271,69 @@ def get_conversation(conv_id):
 # ------------------------------------------------------------------
 @app.route('/conversations/<int:conv_id>/messages', methods=['POST'])
 def create_message(conv_id):
-    conversation = Conversation.query.get(conv_id)
-    if conversation is None:
-        return jsonify({"error": "Conversation bulunamadi"}), 404
+    try:
+        conversation = Conversation.query.get(conv_id)
+        if conversation is None:
+            return jsonify({"error": "Conversation bulunamadi"}), 404
 
-    data = request.get_json(silent=True) or {}
-    role = data.get("role")
-    content = data.get("content")
-    if not role:
-        return jsonify({"error": "role alani zorunlu"}), 400
-    if not content:
-        return jsonify({"error": "content alani zorunlu"}), 400
+        data = request.get_json(silent=True) or {}
+        role = data.get("role")
+        content = data.get("content")
+        if not role:
+            return jsonify({"error": "role alani zorunlu"}), 400
+        if not content:
+            return jsonify({"error": "content alani zorunlu"}), 400
 
-    message = Message(conversation_id=conv_id, role=role, content=content)
-    db.session.add(message)
-    db.session.commit()
+        message = Message(conversation_id=conv_id, role=role, content=content)
+        db.session.add(message)
+        db.session.commit()
 
-    return jsonify({
-        "id": message.id,
-        "role": message.role,
-        "content": message.content,
-        "timestamp": message.timestamp.isoformat(),
-    }), 201
+        return jsonify({
+            "id": message.id,
+            "role": message.role,
+            "content": message.content,
+            "timestamp": message.timestamp.isoformat(),
+        }), 201
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e), "status": "error", "traceback": traceback.format_exc()}), 500
 
 @app.route('/conversations/<int:conv_id>', methods=['DELETE'])
 def delete_conversation(conv_id):
-    conversation = Conversation.query.get(conv_id)
-    if conversation is None:
-        return jsonify({"error": "Conversation bulunamadi"}), 404
+    try:
+        conversation = Conversation.query.get(conv_id)
+        if conversation is None:
+            return jsonify({"error": "Conversation bulunamadi"}), 404
 
-    # Message'lar cascade="all, delete-orphan" sayesinde otomatik silinir.
-    db.session.delete(conversation)
-    db.session.commit()
+        # Message'lar cascade="all, delete-orphan" sayesinde otomatik silinir.
+        db.session.delete(conversation)
+        db.session.commit()
 
-    return jsonify({"status": "success"}), 200
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e), "status": "error", "traceback": traceback.format_exc()}), 500
 
 @app.route('/conversations/<int:conv_id>/messages', methods=['GET'])
 def list_messages(conv_id):
-    conversation = Conversation.query.get(conv_id)
-    if conversation is None:
-        return jsonify({"error": "Conversation bulunamadi"}), 404
+    try:
+        conversation = Conversation.query.get(conv_id)
+        if conversation is None:
+            return jsonify({"error": "Conversation bulunamadi"}), 404
 
-    messages = Message.query.filter_by(conversation_id=conv_id).order_by(Message.timestamp).all()
-    return jsonify([
-        {
-            "id": m.id,
-            "role": m.role,
-            "content": m.content,
-            "timestamp": m.timestamp.isoformat(),
-        }
-        for m in messages
-    ])
+        messages = Message.query.filter_by(conversation_id=conv_id).order_by(Message.timestamp).all()
+        return jsonify([
+            {
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "timestamp": m.timestamp.isoformat(),
+            }
+            for m in messages
+        ])
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e), "status": "error", "traceback": traceback.format_exc()}), 500
 
 
 # ------------------------------------------------------------------

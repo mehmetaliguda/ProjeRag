@@ -365,7 +365,14 @@ async getConversations(notebookId: string): Promise<Conversation[]> {
       throw this.handleError(error)
     }
   }
-
+// Backend: DELETE /notebooks/<nb_id>
+  async deleteNotebook(notebookId: string): Promise<void> {
+    try {
+      await this.client.delete(`/notebooks/${notebookId}`)
+    } catch (error) {
+      throw this.handleError(error)
+    }
+  }
   // Backend: DELETE /rooms/<room_id>
   async deleteRoom(roomId: string): Promise<void> {
     try {
