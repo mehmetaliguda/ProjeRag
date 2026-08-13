@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
-import { ragClient, CitationInfo } from '@/lib/api-client'
+import { ragClient, CitationInfo, MSSQLConfigPayload, MSSQLConfig as BackendMSSQLConfig } from '@/lib/api-client'
 import { applyTheme } from '@/lib/themes'   // dosyanın başına ekle
 
 export type ThemeType = 'light' | 'dark' | 'dust-pink' | 'blue' | 'green' | 'purple'
@@ -26,8 +26,12 @@ export interface MSSQLConfig {
   port: number
   database: string
   username: string
-  password: string
+  password?: string
   connectionString?: string
+  tableName?: string
+  timestampColumn?: string
+  textColumns?: string[]
+  windowSize?: number
   isConfigured: boolean
 }
 
@@ -98,8 +102,9 @@ interface AppStore {
   setActiveCitation: (citation: CitationInfo | null) => void
 
   // MSSQL Config actions
-  setMSSQLConfig: (notebookId: string, config: MSSQLConfig) => void
-  getMSSQLConfig: (notebookId: string) => MSSQLConfig | null
+  setMSSQLConfig: (notebookId: string, config: MSSQLConfigPayload) => Promise<void>
+  getMSSQLConfig: (notebookId: string) => Promise<MSSQLConfig | null>
+  deleteMSSQLConfig: (notebookId: string) => Promise<void>
 
   // Theme actions
   setTheme: (theme: ThemeType) => void
@@ -390,7 +395,12 @@ export const useAppStore = create<AppStore>()(
 
         // temp-... placeholder id'leri backend'de hic var olmadi, silme cagrisi atlanir.
         if (useServerSync && !docId.startsWith('temp-')) {
-          await ragClient.deleteRoom(docId)
+          try {
+            await ragClient.deleteRoom(docId)
+          } catch (err) {
+            console.error('[removeDocumentFromNotebook] backend silme başarısız:', docId, err)
+            throw err instanceof Error ? err : new Error('Silme işlemi başarısız oldu.')
+          }
         }
 
         set((state) => ({
@@ -400,8 +410,6 @@ export const useAppStore = create<AppStore>()(
                   ...nb,
                   documentCount: Math.max(0, nb.documentCount - 1),
                   documents: nb.documents.filter((d) => d.id !== docId),
-                  // Silinen belge, notebook'taki TUM conversation'larin secim
-                  // listesinden de cikarilir.
                   conversations: nb.conversations.map((c) => ({
                     ...c,
                     selectedDocumentIds: c.selectedDocumentIds.filter((id) => id !== docId),
@@ -437,20 +445,69 @@ export const useAppStore = create<AppStore>()(
       },
 
       // MSSQL Config actions
-      setMSSQLConfig: (notebookId: string, config: MSSQLConfig) => {
+      setMSSQLConfig: async (notebookId: string, config: MSSQLConfigPayload) => {
+        const result = await ragClient.setMSSQLConfig(notebookId, config)
+
+        const newConfig: MSSQLConfig = {
+          server: config.server,
+          port: config.port,
+          database: config.database,
+          username: config.username,
+          password: config.password,
+          tableName: config.table_name,
+          timestampColumn: config.timestamp_column,
+          textColumns: config.text_columns,
+          windowSize: config.window_size,
+          isConfigured: result.is_configured,
+        }
+
         set((state) => ({
           notebooks: state.notebooks.map((nb) =>
             nb.id === notebookId
-              ? { ...nb, mssqlConfig: config, updatedAt: new Date() }
+              ? { ...nb, mssqlConfig: newConfig, updatedAt: new Date() }
               : nb
           ),
         }))
       },
 
-      getMSSQLConfig: (notebookId: string) => {
-        const state = get()
-        const notebook = state.notebooks.find((nb) => nb.id === notebookId)
-        return notebook?.mssqlConfig || null
+      getMSSQLConfig: async (notebookId: string) => {
+        const backendConfig: BackendMSSQLConfig | null = await ragClient.getMSSQLConfig(notebookId)
+
+        const newConfig: MSSQLConfig | null = backendConfig
+          ? {
+              server: backendConfig.server,
+              port: backendConfig.port,
+              database: backendConfig.database,
+              username: backendConfig.username,
+              tableName: backendConfig.table_name,
+              timestampColumn: backendConfig.timestamp_column,
+              textColumns: backendConfig.text_columns,
+              windowSize: backendConfig.window_size,
+              isConfigured: backendConfig.is_configured,
+            }
+          : null
+
+        set((state) => ({
+          notebooks: state.notebooks.map((nb) =>
+            nb.id === notebookId
+              ? { ...nb, mssqlConfig: newConfig, updatedAt: new Date() }
+              : nb
+          ),
+        }))
+
+        return newConfig
+      },
+
+      deleteMSSQLConfig: async (notebookId: string) => {
+        await ragClient.deleteMSSQLConfig(notebookId)
+
+        set((state) => ({
+          notebooks: state.notebooks.map((nb) =>
+            nb.id === notebookId
+              ? { ...nb, mssqlConfig: null, updatedAt: new Date() }
+              : nb
+          ),
+        }))
       },
 
       // Document selection actions (multi-select)

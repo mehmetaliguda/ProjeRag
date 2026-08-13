@@ -1,8 +1,14 @@
 'use client'
 
+import { useEffect, useState } from 'react'
+import { Database } from 'lucide-react'
 import { useAppStore } from '@/lib/store'
 import type { Document } from '@/lib/store'
+import { ragClient } from '@/lib/api-client'
 import { PdfDropzone } from '@/components/upload/pdf-dropzone'
+
+const EMPTY_DOCUMENTS: Document[] = []
+const EMPTY_SELECTED_IDS: string[] = []
 
 interface SourcesPanelProps {
   notebookId: string
@@ -17,19 +23,49 @@ const STATUS_STYLES: Record<Document['status'], { label: string; className: stri
 }
 
 export function SourcesPanel({ notebookId, conversationId }: SourcesPanelProps) {
-  const notebooks = useAppStore((state) => state.notebooks)
+  const getNotebookDocuments = useAppStore((state) => state.getNotebookDocuments)
+  const documents = useAppStore((state) => {
+    const notebook = state.notebooks.find((n) => n.id === notebookId)
+    return notebook?.documents ?? EMPTY_DOCUMENTS
+  })
+  void getNotebookDocuments // available if preferred over direct selector
+
+  const selectedDocumentIds = useAppStore((state) => {
+    const notebook = state.notebooks.find((n) => n.id === notebookId)
+    const conversation = notebook?.conversations.find((c) => c.id === conversationId)
+    return conversation?.selectedDocumentIds ?? EMPTY_SELECTED_IDS
+  })
+
   const toggleDocumentSelection = useAppStore((state) => state.toggleDocumentSelection)
   const selectAllDocuments = useAppStore((state) => state.selectAllDocuments)
   const clearDocumentSelection = useAppStore((state) => state.clearDocumentSelection)
   const removeDocumentFromNotebook = useAppStore((state) => state.removeDocumentFromNotebook)
 
-  const notebook = notebooks.find((n) => n.id === notebookId)
-  const documents = notebook?.documents ?? []
-  const conversation = notebook?.conversations.find((c) => c.id === conversationId)
-  const selectedDocumentIds = conversation?.selectedDocumentIds ?? []
-
   const hasDocuments = documents.length > 0
   const hasConversation = Boolean(conversationId)
+
+  // Bu notebook icin MSSQL kaynagi yapilandirilmis mi? Sanal kaynak satirini
+  // sadece configured ise gosteriyoruz.
+  const [isMSSQLConfigured, setIsMSSQLConfigured] = useState(false)
+  const mssqlSourceId = `mssql:${notebookId}`
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function checkMSSQLConfig() {
+      try {
+        const config = await ragClient.getMSSQLConfig(notebookId)
+        if (!cancelled) setIsMSSQLConfigured(Boolean(config?.is_configured))
+      } catch {
+        if (!cancelled) setIsMSSQLConfigured(false)
+      }
+    }
+
+    if (notebookId) checkMSSQLConfig()
+    return () => {
+      cancelled = true
+    }
+  }, [notebookId])
 
   return (
     <div className="h-full flex flex-col">
@@ -45,21 +81,41 @@ export function SourcesPanel({ notebookId, conversationId }: SourcesPanelProps) 
           </button>
           <button
             onClick={() => hasConversation && clearDocumentSelection(notebookId, conversationId)}
-            disabled={Boolean(!hasConversation || !hasDocuments)}
+            disabled={!hasConversation || !hasDocuments}
             className="text-xs text-blue-600 hover:underline disabled:text-gray-300 disabled:no-underline"
           >
-            Tümünü Seç
+            Seçimi Temizle
           </button>
         </div>
       </div>
 
       <div className="flex-1 overflow-y-auto">
-        {!hasDocuments ? (
+        {!hasDocuments && !isMSSQLConfigured ? (
           <div className="flex h-full items-center justify-center px-4 py-8 text-center text-sm text-gray-400">
             Henüz kaynak eklenmedi
           </div>
         ) : (
           <ul className="divide-y divide-gray-100">
+            {isMSSQLConfigured && (
+              <li className="flex items-center gap-2 bg-blue-50/40 px-3 py-2.5 hover:bg-blue-50">
+                <input
+                  type="checkbox"
+                  checked={selectedDocumentIds.includes(mssqlSourceId)}
+                  disabled={!hasConversation}
+                  onChange={() =>
+                    toggleDocumentSelection(notebookId, conversationId, mssqlSourceId)
+                  }
+                  className="h-4 w-4 flex-shrink-0 rounded border-gray-300 text-blue-600"
+                />
+                <Database className="h-3.5 w-3.5 flex-shrink-0 text-blue-600" />
+                <span className="min-w-0 flex-1 truncate text-sm font-medium text-gray-800">
+                  SQL Kaynağı
+                </span>
+                <span className="flex-shrink-0 rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-medium text-blue-700">
+                  Bağlı
+                </span>
+              </li>
+            )}
             {documents.map((doc) => {
               const isSelected = selectedDocumentIds.includes(doc.id)
               const statusStyle = STATUS_STYLES[doc.status]
@@ -81,7 +137,12 @@ export function SourcesPanel({ notebookId, conversationId }: SourcesPanelProps) 
                     {statusStyle.label}
                   </span>
                   <button
-                    onClick={() => removeDocumentFromNotebook(notebookId, doc.id)}
+                    onClick={() => {
+  removeDocumentFromNotebook(notebookId, doc.id).catch((err) => {
+    console.error('Kaynak silinemedi:', err)
+    alert(err instanceof Error ? err.message : 'Kaynak silinemedi.')
+  })
+}}
                     aria-label={`${doc.name} kaynağını sil`}
                     className="flex-shrink-0 rounded p-1 text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600"
                   >

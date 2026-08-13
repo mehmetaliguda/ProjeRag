@@ -24,7 +24,9 @@ from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_chroma import Chroma
-from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_community.document_loaders import PyMuPDFLoader, TextLoader, Docx2txtLoader
+from pptx import Presentation  # unstructured yerine: onnx/pdfminer/poppler gibi agir
+                                # bagimliliklari yok, sadece pptx okumak icin python-pptx yeterli
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage
@@ -35,6 +37,8 @@ from hybrid_retriever import HybridRetriever, CrossEncoderReranker
 
 from database import db
 from models import Room
+import subprocess
+import tempfile
 
 load_dotenv()
 
@@ -100,6 +104,85 @@ def safe_dirname(name: str) -> str:
     base = re.sub(r"[\\/:*?\"<>|]", "_", base)
     return base or "default"
 
+class _PptxLoader:
+    """Docx2txtLoader/TextLoader ile ayni sozlesme: .load() -> List[Document]."""
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+
+    def load(self) -> List[Document]:
+        prs = Presentation(self.file_path)
+        docs = []
+        for i, slide in enumerate(prs.slides):
+            lines = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        line = "".join(run.text for run in para.runs)
+                        if line.strip():
+                            lines.append(line)
+            slide_text = "\n".join(lines).strip()
+            if slide_text:
+                docs.append(Document(page_content=slide_text, metadata={"page": i}))
+        return docs
+
+def _convert_legacy_office(file_path: str, target_ext: str) -> str:
+    """.doc -> .docx / .ppt -> .pptx icin LibreOffice headless donusturme.
+    Basarisizsa RuntimeError firlatir, caller (_get_loader) bunu yakalayip
+    anlamli bir hata mesaji verir."""
+    tmpdir = tempfile.mkdtemp(prefix="legacy_office_")
+    try:
+        result = subprocess.run(
+            [
+                "soffice", "--headless", "--norestore",
+                "--convert-to", target_ext.lstrip("."),
+                "--outdir", tmpdir,
+                file_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"LibreOffice donusturme basarisiz (code={result.returncode}): "
+                f"{result.stderr.strip()}"
+            )
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        converted_path = os.path.join(tmpdir, f"{base_name}{target_ext}")
+        if not os.path.exists(converted_path):
+            raise RuntimeError(
+                f"Donusturme sonrasi beklenen dosya bulunamadi: {converted_path}"
+            )
+        return converted_path
+    except FileNotFoundError:
+        raise RuntimeError(
+            "LibreOffice (soffice) sistemde kurulu degil. "
+            "'sudo apt-get install -y libreoffice' ile kur."
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("LibreOffice donusturme zaman asimina ugradi (60sn).")
+
+def _get_loader(file_path: str):
+    """Uzantiya gore .load() -> List[Document] dondüren loader secer.
+    .doc/.ppt (eski binary OLE2 format) icin once LibreOffice ile
+    .docx/.pptx'e donusturulur, sonra ayni loader'lar kullanilir."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".pdf":
+        return PyMuPDFLoader(file_path)
+    if ext in (".md", ".txt"):
+        return TextLoader(file_path, encoding="utf-8")
+    if ext == ".docx":
+        return Docx2txtLoader(file_path)
+    if ext == ".doc":
+        converted = _convert_legacy_office(file_path, ".docx")
+        return Docx2txtLoader(converted)
+    if ext == ".pptx":
+        return _PptxLoader(file_path)
+    if ext == ".ppt":
+        converted = _convert_legacy_office(file_path, ".pptx")
+        return _PptxLoader(converted)
+    raise ValueError(f"Desteklenmeyen dosya formati: {ext}")
 
 # ------------------------------------------------------------------
 # Kaynak-etiketleme prompt'u ve [[c:N]] parse mantigi TEK yerde
@@ -220,7 +303,40 @@ class RagRoom:
         raw = f"{room_id}|{source}|{page}|{content}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    def index_pdf(self, force: bool = False):
+    def _ocr_fallback_for_pages(self, page_nums: List[int]) -> Dict[int, str]:
+        """Taranmis (metin katmani yok/az) sayfalar icin Falcon-OCR fallback.
+
+        page_nums bos ise FalconOCR HIC yuklenmez (VRAM'e dokunulmaz).
+        Doluysa TEK bir `with FalconOCR() as ocr:` blogu icinde listedeki
+        TUM sayfalar sirayla islenir - her sayfa icin ayri context acip
+        kapatmak hem yavas olur hem gereksiz yukleme/indirme dongusu
+        yaratir, o yuzden yukleme/indirme tam olarak bu metodun basinda/
+        sonunda bir kere olur."""
+        if not page_nums:
+            return {}
+
+        import fitz
+        from PIL import Image
+        from ocr_utils import FalconOCR
+
+        results: Dict[int, str] = {}
+        print(f"[{self.room_id}] OCR modeli yukleniyor ({len(page_nums)} sayfa icin)")
+        with FalconOCR() as ocr:
+            with fitz.open(self.pdf_path) as doc:
+                for page_num in page_nums:
+                    if page_num < 0 or page_num >= len(doc):
+                        continue
+                    pix = doc[page_num].get_pixmap(dpi=200)
+                    image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                    try:
+                        results[page_num] = ocr.extract_text(image, mode="plain")
+                    except Exception as e:
+                        print(f"[{self.room_id}] OCR hatasi (sayfa {page_num}): {e}")
+                        results[page_num] = ""
+        print(f"[{self.room_id}] OCR modeli indirildi, VRAM bosaltildi")
+        return results
+
+    def index_source(self, force: bool = False):
         if force and os.path.exists(self.chroma_dir):
             print(f"[{self.room_id}] force=True, chroma_db siliniyor.")
             shutil.rmtree(self.chroma_dir)
@@ -233,8 +349,49 @@ class RagRoom:
             if existing and len(existing.get("ids", [])) > 0:
                 return
 
-        loader = PyMuPDFLoader(self.pdf_path)
-        docs = loader.load()
+        ext = os.path.splitext(self.pdf_path)[1].lower()
+        IMAGE_EXTS = (".jpg", ".jpeg", ".png")
+
+        if ext == ".pdf":
+            # PyMuPDFLoader ile once normal metni cikar, sonra taranmis
+            # (metin katmani yok/az) sayfalari tespit et: strip() sonrasi
+            # 20 karakterden az metin -> OCR'a dusecek aday sayfa.
+            loader = PyMuPDFLoader(self.pdf_path)
+            docs = loader.load()
+            ocr_page_nums = [
+                d.metadata.get("page", i)
+                for i, d in enumerate(docs)
+                if len(d.page_content.strip()) < 20
+            ]
+            if ocr_page_nums:
+                ocr_texts = self._ocr_fallback_for_pages(ocr_page_nums)
+                for d in docs:
+                    page = d.metadata.get("page")
+                    ocr_text = ocr_texts.get(page)
+                    if ocr_text:
+                        d.page_content = ocr_text
+        elif ext in IMAGE_EXTS:
+            # Dogrudan resim yuklemesi: _get_loader() dispatch'ine girmez,
+            # tek resim TEK bir FalconOCR context'i icinde OCR'lanir
+            # (job sonunda otomatik indirilir), sonra normal splitter'dan
+            # gecirilir. "Sayfa" kavrami yok, page=0 sabit kalir (bkz.
+            # asagidaki chunk dongusu).
+            from PIL import Image
+
+            print(f"[{self.room_id}] OCR modeli yukleniyor (1 sayfa icin)")
+            from ocr_utils import FalconOCR
+            with FalconOCR() as ocr:
+                image = Image.open(self.pdf_path).convert("RGB")
+                try:
+                    ocr_text = ocr.extract_text(image, mode="plain")
+                except Exception as e:
+                    print(f"[{self.room_id}] OCR hatasi: {e}")
+                    ocr_text = ""
+            print(f"[{self.room_id}] OCR modeli indirildi, VRAM bosaltildi")
+            docs = [Document(page_content=ocr_text, metadata={"page": 0})] if ocr_text.strip() else []
+        else:
+            loader = _get_loader(self.pdf_path)
+            docs = loader.load()
 
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
@@ -252,9 +409,19 @@ class RagRoom:
         meta_dict: Dict[str, dict] = {}
 
         for i, chunk in enumerate(chunks):
-            page = chunk.metadata.get("page", -1)
+            # PDF disi formatlarda "sayfa" kavrami yok; citation/get_page_text
+            # akisini kirmamak icin sequential chunk_index "page" gibi kullanilir.
+            # Resim yuklemesinde ise tek bir "sayfa" soz konusu oldugu icin
+            # (uzun OCR ciktisi birden fazla chunk'a bolunse bile) page=0 sabit kalir.
+            if ext == ".pdf":
+                page = chunk.metadata.get("page", -1)
+            elif ext in IMAGE_EXTS:
+                page = 0
+            else:
+                page = i
             chunk.metadata["source"] = source_name
             chunk.metadata["chunk_index"] = i
+            chunk.metadata["page"] = page
             chunk_id = self._chunk_id(self.room_id, source_name, page, chunk.page_content)
             ids.append(chunk_id)
             doc_dict[chunk_id] = chunk.page_content
@@ -272,24 +439,43 @@ class RagRoom:
             self._hybrid_initialized = True
             print(f"[{self.room_id}] Hybrid retriever indexlendi: {len(doc_dict)} belge")
 
+    index_pdf = index_source  # geriye donukluk: eski cagiran yerler kirilmasin
+
     def get_page_text(self, page_num: int, max_chars: int = 3000) -> Optional[str]:
-        """Gorsel bulunamayan sayfalar icin fallback: PDF'den o sayfanin metnini cikarir."""
+        """Gorsel bulunamayan sayfalar icin fallback: kaynagin o "sayfasinin" metnini cikarir."""
         if page_num is None:
             return None
-        try:
-            import fitz
-            with fitz.open(self.pdf_path) as doc:
-                if page_num < 0 or page_num >= len(doc):
+        ext = os.path.splitext(self.pdf_path)[1].lower()
+        if ext == ".pdf":
+            try:
+                import fitz
+                with fitz.open(self.pdf_path) as doc:
+                    if page_num < 0 or page_num >= len(doc):
+                        return None
+                    text = doc[page_num].get_text().strip()
+                    if not text:
+                        return None
+                    if len(text) > max_chars:
+                        text = text[:max_chars] + "..."
+                    return text
+            except Exception as e:
+                print(f"[{self.room_id}] Sayfa metni okunamadi (sayfa {page_num}): {e}")
+                return None
+        else:
+            # PDF disi formatlarda page = sequential chunk_index; o chunk'in
+            # icerigini vectorstore'dan cekiyoruz (fitz.open DENENMEZ).
+            try:
+                result = self.vectorstore.get(where={"page": page_num}, include=["documents"])
+                docs = result.get("documents") or []
+                if not docs:
                     return None
-                text = doc[page_num].get_text().strip()
-                if not text:
-                    return None
+                text = docs[0]
                 if len(text) > max_chars:
                     text = text[:max_chars] + "..."
                 return text
-        except Exception as e:
-            print(f"[{self.room_id}] Sayfa metni okunamadi (sayfa {page_num}): {e}")
-            return None
+            except Exception as e:
+                print(f"[{self.room_id}] Chunk metni okunamadi (chunk {page_num}): {e}")
+                return None
 
     def _is_relevant(self, doc: Document, question: str) -> bool:
         prompt = (
@@ -451,6 +637,29 @@ class RoomManager:
     def __init__(self):
         os.makedirs(ROOMS_ROOT, exist_ok=True)
         self._rooms: Dict[str, RagRoom] = {}
+        self._mssql_sources: Dict[int, "MssqlSource"] = {}
+
+    def get_mssql_source(self, notebook_id: int) -> "MssqlSource":
+        """Notebook'a bagli canli MSSQL kaynagini getirir (RAM'de cache'li).
+        get_room ile ayni sozlesme: config yoksa FileNotFoundError firlatir."""
+        if notebook_id in self._mssql_sources:
+            return self._mssql_sources[notebook_id]
+
+        from models import MSSQLConfig
+        config = MSSQLConfig.query.filter_by(notebook_id=notebook_id).first()
+        if config is None:
+            raise FileNotFoundError(
+                f"Bu notebook icin MSSQL konfigurasyonu bulunamadi: {notebook_id}"
+            )
+
+        from mssql_source import MssqlSource
+        source = MssqlSource(notebook_id=notebook_id, config=config)
+        self._mssql_sources[notebook_id] = source
+        return source
+
+    def invalidate_mssql_source(self, notebook_id: int) -> None:
+        """MSSQL config guncellenince/silinince cache'teki eski instance'i temizler."""
+        self._mssql_sources.pop(notebook_id, None)
 
     def list_rooms(self):
         rows = Room.query.order_by(Room.created_at).all()
@@ -518,7 +727,8 @@ class RoomManager:
             else os.path.join(ROOMS_ROOT, room_id)
         )
         os.makedirs(room_dir, exist_ok=True)
-        permanent_pdf_path = os.path.join(room_dir, "source.pdf")
+        ext = os.path.splitext(tmp_pdf_path)[1].lower()
+        permanent_pdf_path = os.path.join(room_dir, f"source{ext}")
         shutil.copy(tmp_pdf_path, permanent_pdf_path)
         image_dir = os.path.join(room_dir, "images")
 
@@ -574,29 +784,45 @@ def _select_balanced_candidates(reranked: List[Dict], top_k: int, room_ids: List
     return selected[:top_k]
 
 
+def _resolve_source(room_id: str):
+    """room_id 'mssql:<notebook_id>' formatindaysa canli MSSQL kaynagini,
+    degilse normal PDF/dokuman odasini doner. Boylece get_multi_room_answer
+    kaynak turunu bilmeden calisabilir."""
+    if isinstance(room_id, str) and room_id.startswith("mssql:"):
+        notebook_id = int(room_id.split(":", 1)[1])
+        return room_manager.get_mssql_source(notebook_id)
+    return room_manager.get_room(room_id)
+
+
 def get_multi_room_answer(room_ids: List[str], mesaj: str) -> dict:
-    """Birden fazla room'un retrieval sonucunu birlestirip TEK cevap
-    uretir. Tek turlu calisir (LangGraph/MemorySaver KULLANMAZ —
-    query-rewrite retry mantigi da bu ilk versiyonda YOK, bilinen
-    bir sinirlama olarak birak)."""
-    rooms = [room_manager.get_room(rid) for rid in room_ids]
+    """Birden fazla room'un (veya MSSQL kaynaginin) retrieval sonucunu
+    birlestirip TEK cevap uretir. Tek turlu calisir (LangGraph/MemorySaver
+    KULLANMAZ — query-rewrite retry mantigi da bu ilk versiyonda YOK,
+    bilinen bir sinirlama olarak birak)."""
+    sources = [_resolve_source(rid) for rid in room_ids]
 
     optimized_query = (
         _multi_room_query_optimizer.optimize_for_retrieval(mesaj) if USE_QUERY_OPTIMIZER else mesaj
     )
 
     all_results = []
-    for room in rooms:
-        room._ensure_hybrid_initialized()
-        results = room.hybrid_retriever.retrieve(optimized_query, k=MULTI_ROOM_RETRIEVE_K)
+    for source in sources:
+        if hasattr(source, "hybrid_retriever"):
+            # Normal PDF/dokuman odasi
+            source._ensure_hybrid_initialized()
+            results = source.hybrid_retriever.retrieve(optimized_query, k=MULTI_ROOM_RETRIEVE_K)
+        else:
+            # Canli MSSQL kaynagi: kendi butceli retrieve() sozlesmesini kullanir,
+            # ayri bir rerank YAPMAZ (asagida tum kaynaklar TEK rerank cagrisinda birlesir).
+            results = source.retrieve(mesaj, k=MULTI_ROOM_RETRIEVE_K)
         for r in results:
-            r["room_id"] = room.room_id
-        print(f"[multi-room] {room.room_id}: {len(results)} aday, "
-              f"en yuksek hybrid score={results[0]['score'] if results else '-'}")
+            r["room_id"] = source.room_id
+        print(f"[multi-room] {source.room_id}: {len(results)} aday, "
+              f"en yuksek score={results[0]['score'] if results else '-'}")
         all_results.extend(results)
 
     # Oda sayisi arttikca taban 6'nin uzerine cikabilsin diye olcekli TOP_K.
-    top_k = min(12, max(MULTI_ROOM_TOP_K, 2 * len(rooms)))
+    top_k = min(12, max(MULTI_ROOM_TOP_K, 2 * len(sources)))
 
     # Tum odalardan gelen adaylar TEK bir LLM cagrisiyla puanlanir (adaylar
     # icin ayri ayri cagri YOK) ve min_score altinda kalanlar elenir —
@@ -623,12 +849,13 @@ def get_multi_room_answer(room_ids: List[str], mesaj: str) -> dict:
                 "rerank_score": r.get("rerank_score", 0),
                 "page": r.get("page", -1),
                 "room_id": r.get("room_id", ""),
+                "timestamp": r.get("timestamp"),
             },
         )
         for r in reranked
     ]
 
-    rooms_by_id = {r.room_id: r for r in rooms}
+    rooms_by_id = {s.room_id: s for s in sources}
 
     # Dedupe key SADECE page degil, room_id + page: ayni sayfa numarasi
     # farkli PDF'lerde cakisabilir.
@@ -653,14 +880,23 @@ def get_multi_room_answer(room_ids: List[str], mesaj: str) -> dict:
             "room_id": room_id,
             "score": doc.metadata.get("score", 0),
             "rerank_score": doc.metadata.get("rerank_score", 0),
+            "content": doc.page_content,
+            "timestamp": doc.metadata.get("timestamp"),
         }
         numbered_docs.append((idx, page, room_id, doc))
 
     if not numbered_docs:
         return {"text": "Belgede bu soruyla ilgili yeterli bilgi bulamadim.", "citations": {}}
 
+    def _source_label(room_id: str, page: int) -> str:
+        display_name = rooms_by_id[room_id].display_name
+        if page is not None and page >= 0:
+            return f"(Belge: {display_name}, Sayfa {page})"
+        # MSSQL gibi sayfa kavrami olmayan kaynaklar icin "Sayfa" gosterilmez.
+        return f"(Kaynak: {display_name})"
+
     context = "\n\n".join(
-        f"[Kaynak {idx}] (Belge: {rooms_by_id[room_id].display_name}, Sayfa {page}):\n{doc.page_content}"
+        f"[Kaynak {idx}] {_source_label(room_id, page)}:\n{doc.page_content}"
         for idx, page, room_id, doc in numbered_docs
     )
 
@@ -678,17 +914,28 @@ def get_multi_room_answer(room_ids: List[str], mesaj: str) -> dict:
         if info is None:
             continue
         page = info.get("page")
-        if page is None or page < 0:
-            continue
         room_id = info.get("room_id")
-        room = rooms_by_id.get(room_id)
-        citations[str(idx)] = {
+        is_mssql = isinstance(room_id, str) and room_id.startswith("mssql:")
+        # PDF/dokuman kaynaklarinda gecerli bir sayfa sart; MSSQL kaynaklarinda
+        # page hep -1 oldugundan bu kontrol atlanir (spec geregi).
+        if not is_mssql and (page is None or page < 0):
+            continue
+        if is_mssql:
+            # PDF sayfa metni yerine dogrudan cekilen log content'i kullanilir.
+            text = info.get("content", "")
+        else:
+            room = rooms_by_id.get(room_id)
+            text = room.get_page_text(page) if room else ""
+        citation_entry = {
             "page": page,
-            "text": room.get_page_text(page) if room else "",
+            "text": text,
             "score": info.get("score", 0),
             "rerank_score": info.get("rerank_score", 0),
             "room_id": room_id,
         }
+        if is_mssql and info.get("timestamp") is not None:
+            citation_entry["timestamp"] = info.get("timestamp")
+        citations[str(idx)] = citation_entry
     print(f"mesaj: {answer_text},                                   citations: {citations}")
     return {"text": answer_text, "citations": citations}
 

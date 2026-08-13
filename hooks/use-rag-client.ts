@@ -58,6 +58,9 @@ export function useRagClient({ notebookId, conversationId }: UseRagClientOptions
         ragClient.setCurrentConversation(conversationId)
       }
       try {
+        if (documentIds.length === 0) {
+          throw new Error('Lütfen en az bir kaynak seçin.')
+        }
         const response = await ragClient.chat({
           query: trimmed,
           documentIds,
@@ -75,7 +78,7 @@ export function useRagClient({ notebookId, conversationId }: UseRagClientOptions
         console.error('[useRagClient] sendMessage failed:', {
           notebookId,
           conversationId,
-          error: err,
+          message: err instanceof Error ? err.message : String(err),
         })
         const message = err instanceof Error ? err.message : 'Mesaj gönderilirken bir hata oluştu.'
         setError(message)

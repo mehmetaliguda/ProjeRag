@@ -15,10 +15,26 @@ interface PdfDropzoneProps {
   notebookId: string
 }
 
-function isPdfFile(file: File): boolean {
+const SUPPORTED_EXTENSIONS = ['.pdf', '.md', '.txt', '.docx', '.doc', '.pptx', '.ppt', '.jpg', '.jpeg', '.png']
+
+const SUPPORTED_MIME_TYPES = [
+  'application/pdf',
+  'text/markdown',
+  'text/x-markdown',
+  'text/plain',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/vnd.ms-powerpoint',
+  'image/jpeg',
+  'image/png',
+]
+
+function isSupportedFile(file: File): boolean {
+  const lowerName = file.name.toLowerCase()
   return (
-    file.type === 'application/pdf' ||
-    file.name.toLowerCase().endsWith('.pdf')
+    SUPPORTED_MIME_TYPES.includes(file.type) ||
+    SUPPORTED_EXTENSIONS.some((ext) => lowerName.endsWith(ext))
   )
 }
 
@@ -48,22 +64,22 @@ export function PdfDropzone({ notebookId }: PdfDropzoneProps) {
       if (!fileList || fileList.length === 0) return
 
       const allFiles = Array.from(fileList)
-      const pdfFiles = allFiles.filter(isPdfFile)
-      const rejected = allFiles.filter((f) => !isPdfFile(f))
+      const supportedFiles = allFiles.filter(isSupportedFile)
+      const rejected = allFiles.filter((f) => !isSupportedFile(f))
 
       if (rejected.length > 0) {
         setRejectedWarning(
-          `Sadece PDF dosyaları desteklenir. Yoksayıldı: ${rejected
+          `PDF, Markdown, TXT, DOC/DOCX, PPT/PPTX ve görsel dosyaları desteklenir. Yoksayıldı: ${rejected
             .map((f) => f.name)
             .join(', ')}`
         )
         clearWarningSoon()
       }
 
-      if (pdfFiles.length === 0) return
+      if (supportedFiles.length === 0) return
 
       // 1. Placeholder Document'lar oluştur, hemen listeye ekle.
-      const placeholders: Document[] = pdfFiles.map((file) => ({
+      const placeholders: Document[] = supportedFiles.map((file) => ({
         id: makeTempId(),
         name: file.name,
         status: 'uploading',
@@ -81,13 +97,13 @@ export function PdfDropzone({ notebookId }: PdfDropzoneProps) {
       ])
 
       // 2. Backend'e paralel yükle.
-      const { succeeded, failed } = await ragClient.createRooms(pdfFiles, notebookId)
+      const { succeeded, failed } = await ragClient.createRooms(supportedFiles, notebookId)
 
       // 3. Başarılı olanları gerçek room bilgisiyle değiştir.
       succeeded.forEach((room, index) => {
         if (!room) return   // <-- yeni: room undefined ise sessizce atla, tüm döngüyü kesme
 
-        // succeeded sırası pdfFiles ile birebir eşleşmeyebileceğinden
+        // succeeded sırası supportedFiles ile birebir eşleşmeyebileceğinden
         // eşleşmeyi dosya adına göre en iyi çaba ile yapıyoruz.
         const roomName = (room as any).name
         const matchIndex = placeholders.findIndex(
@@ -97,9 +113,9 @@ export function PdfDropzone({ notebookId }: PdfDropzoneProps) {
           matchIndex !== -1 ? placeholders[matchIndex] : placeholders[index]
         if (!placeholder) return
 
-        // matchIndex placeholders ile ayni sirada olan pdfFiles'a da karsilik gelir,
+        // matchIndex placeholders ile ayni sirada olan supportedFiles'a da karsilik gelir,
         // bu yuzden gercek dosya boyutunu oradan alabiliyoruz.
-        const matchedFile = matchIndex !== -1 ? pdfFiles[matchIndex] : pdfFiles[index]
+        const matchedFile = matchIndex !== -1 ? supportedFiles[matchIndex] : supportedFiles[index]
 
         removeDocumentFromNotebook(notebookId, placeholder.id)
         addDocumentsToNotebook(notebookId, [
@@ -124,11 +140,9 @@ export function PdfDropzone({ notebookId }: PdfDropzoneProps) {
       })
 
       // 4. Başarısız olanları kaldır, hata göster.
-      failed.forEach((failure: any, index: number) => {
-        const placeholder =
-          placeholders[
-            placeholders.length - failed.length + index
-          ] ?? placeholders.find((p) => p.name === failure?.fileName)
+// 4. Başarısız olanları kaldır, hata göster.
+      failed.forEach((failure) => {
+        const placeholder = placeholders.find((p) => p.name === failure.file)
 
         if (placeholder) {
           removeDocumentFromNotebook(notebookId, placeholder.id)
@@ -138,8 +152,7 @@ export function PdfDropzone({ notebookId }: PdfDropzoneProps) {
                 ? {
                     ...item,
                     status: 'error',
-                    errorMessage:
-                      failure?.message ?? 'Yükleme başarısız oldu.',
+                    errorMessage: failure.error ?? 'Yükleme başarısız oldu.',
                   }
                 : item
             )
@@ -217,15 +230,18 @@ export function PdfDropzone({ notebookId }: PdfDropzoneProps) {
         />
         <p className="text-sm text-muted-foreground">
           <span className="font-medium text-foreground">
-            PDF&apos;leri buraya sürükleyin
+            Dosyaları buraya sürükleyin
           </span>{' '}
           veya seçin
+        </p>
+        <p className="text-xs text-muted-foreground/80">
+          PDF, Markdown, TXT, DOC/DOCX, PPT/PPTX ve görsel dosyaları desteklenir.
         </p>
         <input
           ref={inputRef}
           type="file"
           multiple
-          accept="application/pdf"
+          accept=".pdf,.md,.txt,.docx,.doc,.pptx,.ppt,.jpg,.jpeg,.png,application/pdf,text/markdown,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.ms-powerpoint,image/jpeg,image/png"
           onChange={onInputChange}
           className="hidden"
         />

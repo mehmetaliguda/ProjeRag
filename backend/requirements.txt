@@ -13,6 +13,8 @@ pymupdf==1.23.8
 chromadb==0.4.24
 numpy==1.24.3
 flask-sqlalchemy==3.1.1
+docx2txt
+python-pptx
 
 # Yardımcı kütüphaneler
 python-dotenv==1.0.0
@@ -23,3 +25,26 @@ typing-extensions==4.8.0
 #pip install ollama 
 #ollama pull bge-m3
 #ollama pull qwen2.5:7b-instruct
+
+# FAZ 2 - Falcon-OCR (tiiuae/Falcon-OCR) için gerekli bağımlılıklar
+torch>=2.5
+# NOT: yukarıdaki langchain/langchain-* satırları eski (0.1.x) pinlerle
+# sabitlenmiş; transformers'ı bilerek AYRI/gevşek pinledik çünkü Falcon-OCR
+# (custom_code=True) güncel bir transformers sürümü ister. Kurulumda çakışma
+# çıkarsa (ör. tokenizers/huggingface-hub sürüm çatışması) langchain
+# pinlerini güncellemek gerekebilir.
+transformers>=4.45
+pillow
+einops
+# GPU yoksa Falcon-OCR CPU'da da çalışır ama (300M parametre olsa bile)
+# gözle görülür şekilde yavaş olur.
+
+# FAZ 3 - MSSQL canlı log kaynağı (mssql_source.py, mssql_crypto.py) için gerekli.
+pyodbc
+cryptography
+# ÖNEMLİ: pyodbc'nin çalışması için "ODBC Driver 18 for SQL Server" işletim
+# sistemi seviyesinde AYRICA kurulmalı (pip bunu OTOMATİK KURMAZ).
+# Linux (Debian/Ubuntu) için Microsoft'un resmi kurulum adımları:
+#   https://learn.microsoft.com/sql/connect/odbc/linux-mac/installing-the-microsoft-odbc-driver-for-sql-server
+# Bu driver kurulu değilse pyodbc.connect() "Data source name not found" gibi
+# bir hata ile başarısız olur.

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAppStore } from '@/lib/store'
 import { NotebookCard } from '@/components/notebook-card'
@@ -15,6 +15,24 @@ export default function NotebooksPage() {
   const { notebooks, createNotebook } = useAppStore()
   const [showDialog, setShowDialog] = useState(false)
   const [showMSSQL, setShowMSSQL] = useState(false)
+
+  const validNotebooks = notebooks.filter(
+    (notebook): notebook is NonNullable<typeof notebook> => notebook != null
+  )
+  const [selectedNotebookId, setSelectedNotebookId] = useState<string>(
+    () => validNotebooks[0]?.id ?? ''
+  )
+
+  // Eğer seçili notebook silinmişse veya henüz seçim yapılmamışsa,
+  // listedeki ilk notebook'a düş.
+  useEffect(() => {
+    const stillExists = validNotebooks.some((n) => n.id === selectedNotebookId)
+    if (!stillExists && validNotebooks.length > 0) {
+      setSelectedNotebookId(validNotebooks[0].id)
+    }
+  }, [validNotebooks, selectedNotebookId])
+
+  const selectedNotebook = validNotebooks.find((n) => n.id === selectedNotebookId)
 
   const handleCreateNotebook = (name: string) => {
     createNotebook(name)
@@ -89,7 +107,38 @@ export default function NotebooksPage() {
                 Configure additional knowledge sources for your notebooks
               </p>
             </div>
-            <MSSQLConfigPanel />
+
+            {validNotebooks.length === 0 ? (
+              <div className="rounded-lg border-2 border-dashed border-border bg-card p-8 text-center">
+                <p className="text-sm text-muted-foreground">
+                  Data source configuration requires a notebook. Create a notebook first.
+                </p>
+              </div>
+            ) : (
+              <>
+                <div className="max-w-xs space-y-2">
+                  <label htmlFor="mssql-notebook-select" className="text-sm font-medium">
+                    Notebook
+                  </label>
+                  <select
+                    id="mssql-notebook-select"
+                    value={selectedNotebookId}
+                    onChange={(e) => setSelectedNotebookId(e.target.value)}
+                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                  >
+                    {validNotebooks.map((notebook) => (
+                      <option key={notebook.id} value={notebook.id}>
+                        {notebook.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {selectedNotebook && (
+                  <MSSQLConfigPanel notebookId={Number(selectedNotebook.id)} />
+                )}
+              </>
+            )}
           </div>
         </section>
       </main>

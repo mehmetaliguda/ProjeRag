@@ -63,6 +63,35 @@ export interface BackendChatResponse {
   status: string
 }
 
+// Backend'e gonderilen MSSQL config payload'i
+// POST /notebooks/<nb_id>/mssql-config
+export interface MSSQLConfigPayload {
+  server: string
+  port: number
+  database: string
+  username: string
+  password: string
+  table_name: string
+  timestamp_column: string
+  text_columns: string[]
+  window_size?: number
+}
+
+// Backend'den donen MSSQL config sekli
+// GET /notebooks/<nb_id>/mssql-config
+// Guvenlik nedeniyle backend password alanini geri dondurmuyor.
+export interface MSSQLConfig {
+  server: string
+  port: number
+  database: string
+  username: string
+  table_name: string
+  timestamp_column: string
+  text_columns: string[]
+  window_size?: number
+  is_configured: boolean
+}
+
 export class RAGClient {
   private client: AxiosInstance
   private currentRoomId: string | null = null
@@ -300,6 +329,50 @@ async getNotebooks(): Promise<Notebook[]> {
     try {
       const response = await this.client.get<Notebook[]>('/notebooks')
       return response.data.map((nb) => ({ ...nb, id: String(nb.id) }))
+    } catch (error) {
+      throw this.handleError(error)
+    }
+  }
+
+  // Backend: POST /notebooks/<nb_id>/mssql-config
+  // Beklenen: MSSQLConfigPayload
+  // Dönen: { "is_configured": true/false }
+  async setMSSQLConfig(notebookId: string, config: MSSQLConfigPayload): Promise<{ is_configured: boolean }> {
+    try {
+      const response = await this.client.post<{ is_configured: boolean }>(
+        `/notebooks/${notebookId}/mssql-config`,
+        config
+      )
+      return response.data
+    } catch (error) {
+      throw this.handleError(error)
+    }
+  }
+
+  // Backend: GET /notebooks/<nb_id>/mssql-config
+  // Dönen: MSSQLConfig (password haric)
+  // 404 donerse veya is_configured false ise null dondurur.
+  async getMSSQLConfig(notebookId: string): Promise<MSSQLConfig | null> {
+    try {
+      const response = await this.client.get<MSSQLConfig>(`/notebooks/${notebookId}/mssql-config`)
+
+      if (!response.data || !response.data.is_configured) {
+        return null
+      }
+
+      return response.data
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        return null
+      }
+      throw this.handleError(error)
+    }
+  }
+
+  // Backend: DELETE /notebooks/<nb_id>/mssql-config
+  async deleteMSSQLConfig(notebookId: string): Promise<void> {
+    try {
+      await this.client.delete(`/notebooks/${notebookId}/mssql-config`)
     } catch (error) {
       throw this.handleError(error)
     }

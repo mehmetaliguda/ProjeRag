@@ -11,7 +11,8 @@ import shutil
 from rag_chat import room_manager
 import rag_chat  # room_manager zaten import ediliyor ama ROOMS_ROOT icin modulun kendisi lazim
 from database import db, init_db
-from models import Notebook, Conversation, Message, Room
+from models import Notebook, Conversation, Message, Room, MSSQLConfig
+from mssql_crypto import encrypt_password
 
 app = Flask(__name__)
 CORS(app)
@@ -20,7 +21,7 @@ CORS(app)
 # olusturulmaz yapiyoruz (ilk isteten once calismis olur).
 init_db(app)
 
-ALLOWED_EXT = {".pdf"}
+ALLOWED_EXT = {".pdf", ".md", ".txt", ".docx", ".pptx", ".doc", ".ppt", ".jpg", ".jpeg", ".png"}
 BASE_URL = os.getenv("APP_BASE_URL", "http://sunucuIP:5000")
 
 
@@ -86,7 +87,7 @@ def upload_room():
 
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXT:
-        return jsonify({"error": "Sadece PDF dosyasi yuklenebilir"}), 400
+        return jsonify({"error": f"Desteklenmeyen dosya turu: {ext}"}), 400
 
     display_name = secure_filename(file.filename)
     tmp_path = os.path.join("/tmp", display_name)
@@ -126,6 +127,100 @@ def serve_pdf(room_id):
 
 
 
+
+
+# ------------------------------------------------------------------
+# MSSQL config endpoint'leri (FAZ 3 - canli log kaynagi)
+# ------------------------------------------------------------------
+MSSQL_REQUIRED_FIELDS = ["server", "database_name", "username", "table_name", "timestamp_column", "text_columns"]
+
+
+@app.route('/notebooks/<int:nb_id>/mssql-config', methods=['POST'])
+def upsert_mssql_config(nb_id):
+    try:
+        notebook = Notebook.query.get(nb_id)
+        if notebook is None:
+            return jsonify({"error": "Notebook bulunamadi"}), 404
+
+        data = request.get_json(silent=True) or {}
+        missing = [f for f in MSSQL_REQUIRED_FIELDS if not data.get(f)]
+        if missing:
+            return jsonify({"error": f"Eksik alan(lar): {', '.join(missing)}"}), 400
+
+        text_columns = data.get("text_columns")
+        if not isinstance(text_columns, list) or not text_columns:
+            return jsonify({"error": "text_columns bos olmayan bir liste olmali"}), 400
+
+        config = MSSQLConfig.query.filter_by(notebook_id=nb_id).first()
+        is_new = config is None
+        if is_new:
+            config = MSSQLConfig(notebook_id=nb_id)
+
+        # Yeni kayitta parola zorunlu; guncellemede bos birakilirsa
+        # mevcut sifreli parola KORUNUR (yeniden sifrelenmez).
+        password = data.get("password")
+        if is_new and not password:
+            return jsonify({"error": "Eksik alan(lar): password"}), 400
+
+        config.server = data["server"]
+        config.port = int(data.get("port") or 1433)
+        config.database_name = data["database_name"]
+        config.username = data["username"]
+        config.table_name = data["table_name"]
+        config.timestamp_column = data["timestamp_column"]
+        config.text_columns = text_columns
+        config.fetch_batch_size = int(data.get("fetch_batch_size") or 200)
+        config.max_rows = int(data.get("max_rows") or 2000)
+        config.max_retrieval_tokens = int(data.get("max_retrieval_tokens") or 8192)
+        config.max_retrieval_chars = data.get("max_retrieval_chars")
+        config.reserved_output_tokens = int(data.get("reserved_output_tokens") or 1024)
+        config.max_context_tokens = int(data.get("max_context_tokens") or 32768)
+        if password:
+            config.password_encrypted = encrypt_password(password)
+
+        # DB'ye yazmadan once baglantiyi test et; basarisizsa 400 don, kaydetme.
+        from mssql_source import MssqlSource
+        try:
+            MssqlSource(notebook_id=nb_id, config=config).test_connection()
+        except Exception as e:
+            return jsonify({"error": f"MSSQL baglanti testi basarisiz: {e}"}), 400
+
+        if is_new:
+            db.session.add(config)
+        db.session.commit()
+
+        rag_chat.room_manager.invalidate_mssql_source(nb_id)
+
+        return jsonify(config.to_dict()), 201 if is_new else 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e), "status": "error", "traceback": traceback.format_exc()}), 500
+
+
+@app.route('/notebooks/<int:nb_id>/mssql-config', methods=['GET'])
+def get_mssql_config(nb_id):
+    notebook = Notebook.query.get(nb_id)
+    if notebook is None:
+        return jsonify({"error": "Notebook bulunamadi"}), 404
+
+    config = MSSQLConfig.query.filter_by(notebook_id=nb_id).first()
+    if config is None:
+        return jsonify({"is_configured": False})
+
+    return jsonify(config.to_dict())
+
+
+@app.route('/notebooks/<int:nb_id>/mssql-config', methods=['DELETE'])
+def delete_mssql_config(nb_id):
+    config = MSSQLConfig.query.filter_by(notebook_id=nb_id).first()
+    if config is None:
+        return jsonify({"status": "success", "message": "Zaten yapilandirilmamis"}), 200
+
+    db.session.delete(config)
+    db.session.commit()
+    rag_chat.room_manager.invalidate_mssql_source(nb_id)
+
+    return jsonify({"status": "success"}), 200
 
 
 # ------------------------------------------------------------------
@@ -383,14 +478,23 @@ def chat():
             cite_room_id = info.get("room_id", room_ids[0])
 
             page = info.get("page")
-            pdf_url = f"{BASE_URL}/source-pdf/{cite_room_id}#page={page + 1}" if page is not None else None
+            # MSSQL gibi sayfa kavrami olmayan kaynaklarda (page=-1) PDF url'i
+            # uretilmez; sadece gecerli (>=0) sayfali PDF/dokuman kaynaklarinda uretilir.
+            pdf_url = (
+                f"{BASE_URL}/source-pdf/{cite_room_id}#page={page + 1}"
+                if page is not None and page >= 0
+                else None
+            )
 
-            citations[cid] = {
+            citation_out = {
                 "page": page,
                 "text": info.get("text"),
                 "pdf_url": pdf_url,
                 "room_id": cite_room_id,
             }
+            if info.get("timestamp") is not None:
+                citation_out["timestamp"] = info.get("timestamp")
+            citations[cid] = citation_out
 
         # conversation_id verildiyse kullanici sorusunu ve asistan cevabini kaydet.
         if conversation is not None:
