@@ -10,6 +10,7 @@ from collections import defaultdict
 import math
 import os
 import json
+import re
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 
@@ -243,8 +244,6 @@ class CrossEncoderReranker:
             for i, doc in enumerate(documents):
                 raw_score = scores.get(str(i))
                 if raw_score is None:
-                    # LLM bu indekse hic puan dondurmedi -> sessizce 0 verip
-                    # o room'u tamamen elemek yerine kelime-ortusmesi fallback'i kullan.
                     doc["rerank_score"] = self._fallback_relevance(query, doc.get("content", ""))
                     continue
                 try:
@@ -261,9 +260,12 @@ class CrossEncoderReranker:
 
     def _llm_score(self, query: str, documents: List[Dict[str, Any]]):
         """Tum adaylari tek prompt'ta LLM'e puanlatir. Basarisiz olursa None doner."""
+        
+        # Belgeler çok uzunsa kısalt
         listing = "\n\n".join(
-            f"[{i}] {doc.get('content', '')[:600]}" for i, doc in enumerate(documents)
+            f"[{i}] {doc.get('content', '')[:500]}" for i, doc in enumerate(documents)
         )
+        
         prompt = (
             "Asagida numarali belge parcalari var. Her birinin, verilen soruyla ne kadar "
             "alakali oldugunu 0 (tamamen alakasiz) ile 10 (soruyu dogrudan cevapliyor) "
@@ -276,25 +278,57 @@ class CrossEncoderReranker:
 
         try:
             raw = self.llm.invoke(prompt).content.strip()
-            # Model bazen ```json ... ``` gibi sarabiliyor, temizle.
-            raw = raw.strip("`")
-            if raw.lower().startswith("json"):
-                raw = raw[4:].strip()
-            # json.loads TUM string'in tek bir JSON olmasini bekler; model
-            # JSON'dan SONRA fazladan aciklama/bos satir eklerse
-            # "Extra data" hatasi verip fallback'e dusuruyordu. raw_decode
-            # ise string'in BASINDAKI ilk gecerli JSON degerini alir,
-            # arkasindaki fazlaligi yok sayar.
-            obj, _ = json.JSONDecoder().raw_decode(raw)
-            expected = set(str(i) for i in range(len(documents)))
-            missing = expected - set(obj.keys())
-            if missing:
-                missing_rooms = [documents[int(i)].get("room_id", "?") for i in missing]
-                print(f"[CrossEncoderReranker] UYARI: LLM {len(missing)}/{len(documents)} "
-                      f"indeks icin puan donmedi (indeksler={sorted(missing, key=int)}, "
-                      f"room_id'ler={missing_rooms}). Bu indeksler icin fallback kullanilacak.")
-            print(f"[CrossEncoderReranker] Ham skorlar: {obj}")
-            return obj
+            
+            # JSON'u temizle - markdown code block'larını kaldır
+            raw = re.sub(r'```json\s*', '', raw)
+            raw = re.sub(r'```\s*', '', raw)
+            raw = raw.strip()
+            
+            # Eğer raw boşsa veya çok kısaysa fallback'e dön
+            if not raw or len(raw) < 3:
+                print("[CrossEncoderReranker] LLM boş yanıt döndü")
+                return None
+            
+            # JSON parse et - raw_decode ile ilk geçerli JSON'u al
+            try:
+                obj, end_pos = json.JSONDecoder().raw_decode(raw)
+                # Geçerli JSON bulundu
+                expected = set(str(i) for i in range(len(documents)))
+                missing = expected - set(obj.keys())
+                if missing:
+                    missing_rooms = [documents[int(i)].get("room_id", "?") for i in missing]
+                    print(f"[CrossEncoderReranker] UYARI: LLM {len(missing)}/{len(documents)} "
+                          f"indeks icin puan donmedi (indeksler={sorted(missing, key=int)}, "
+                          f"room_id'ler={missing_rooms}). Bu indeksler icin fallback kullanilacak.")
+                print(f"[CrossEncoderReranker] Ham skorlar: {obj}")
+                return obj
+            except json.JSONDecodeError:
+                # JSON parse edilemedi, alternatif formatları dene
+                print("[CrossEncoderReranker] JSON parse hatası, alternatif format deneniyor...")
+                
+                # Alternatif: "0: 5, 1: 3" formatı
+                pattern = r'(\d+)\s*[:=]\s*(\d+\.?\d*)'
+                matches = re.findall(pattern, raw)
+                if matches:
+                    obj = {}
+                    for idx, score in matches:
+                        obj[idx] = float(score)
+                    print(f"[CrossEncoderReranker] Alternatif formattan skorlar: {obj}")
+                    return obj
+                
+                # Alternatif: "Belge 0: 5" formatı
+                pattern = r'Belge\s*(\d+)\s*[:=]\s*(\d+\.?\d*)'
+                matches = re.findall(pattern, raw, re.IGNORECASE)
+                if matches:
+                    obj = {}
+                    for idx, score in matches:
+                        obj[idx] = float(score)
+                    print(f"[CrossEncoderReranker] 'Belge' formattan skorlar: {obj}")
+                    return obj
+                
+                # Hiçbiri çalışmadı
+                return None
+                
         except Exception as e:
             print(f"[CrossEncoderReranker] LLM rerank hatasi: {e}")
             return None
@@ -303,18 +337,22 @@ class CrossEncoderReranker:
     def _fallback_relevance(query: str, content: str) -> float:
         """Basit kelime-ortusmesi skoru (0-10 araligina olceklenmis). Sadece
         LLM puanlama basarisiz oldugunda kullanilir."""
+        if not query or not content:
+            return 0.0
+            
         query_words = set(query.lower().split())
         content_words = set(content.lower().split())
         if not query_words:
             return 0.0
 
         intersection = query_words.intersection(content_words)
-        jaccard = len(intersection) / len(query_words.union(content_words))
+        jaccard = len(intersection) / len(query_words.union(content_words)) if query_words.union(content_words) else 0
 
         word_weights = {}
+        content_lower = content.lower()
         for word in query_words:
-            if word in content.lower():
-                word_weights[word] = content.lower().count(word) / max(len(content.split()), 1)
+            if word in content_lower:
+                word_weights[word] = content_lower.count(word) / max(len(content.split()), 1)
         weight_score = sum(word_weights.values()) / len(query_words) if query_words else 0
 
         return round((jaccard * 0.6 + weight_score * 0.4) * 10, 2)

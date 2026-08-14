@@ -464,7 +464,9 @@ def chat():
 
         print(f"[FLASK] Oda(lar): {', '.join(room_ids)} | Soru: {user_input}")
 
-        if len(room_ids) == 1:
+        is_single_pdf_room = len(room_ids) == 1 and not room_ids[0].startswith("mssql:")
+
+        if is_single_pdf_room:
             room = room_manager.get_room(room_ids[0])
             result = room.get_rag_answer(user_input)
         else:

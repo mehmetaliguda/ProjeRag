@@ -54,6 +54,8 @@ export interface CitationInfo {
   page: number | null
   text: string
   pdf_url: string | null
+  room_id?: string
+  timestamp?: string
 }
 
 // Backend'den gelen chat yanıtı
@@ -102,7 +104,7 @@ export class RAGClient {
     
     this.client = axios.create({
       baseURL: finalBaseURL,
-      timeout: 30000,
+      timeout: 300000,
       headers: {
         'Content-Type': 'application/json',
       },

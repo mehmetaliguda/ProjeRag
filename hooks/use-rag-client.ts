@@ -54,6 +54,7 @@ export function useRagClient({ notebookId, conversationId }: UseRagClientOptions
       const documentIds = conversation?.selectedDocumentIds ?? []
 
       setIsSending(true)
+      console.debug('[useRagClient] sending', { notebookId, conversationId, documentIds })
       if (useServerSync) {
         ragClient.setCurrentConversation(conversationId)
       }
@@ -65,6 +66,7 @@ export function useRagClient({ notebookId, conversationId }: UseRagClientOptions
           query: trimmed,
           documentIds,
         })
+        console.debug('[useRagClient] response received', response)
 
         const assistantMessage: Message = {
           id: createId(),
@@ -74,11 +76,21 @@ export function useRagClient({ notebookId, conversationId }: UseRagClientOptions
           citations: response.citations,
         }
         addMessage(notebookId, conversationId, assistantMessage)
+        console.debug('[useRagClient] assistant message added to store')
       } catch (err) {
         console.error('[useRagClient] sendMessage failed:', {
           notebookId,
           conversationId,
-          message: err instanceof Error ? err.message : String(err),
+          errType: typeof err,
+          errIsError: err instanceof Error,
+          errRaw: err,
+          errStringified: (() => {
+            try {
+              return JSON.stringify(err, Object.getOwnPropertyNames(err ?? {}))
+            } catch {
+              return 'stringify failed'
+            }
+          })(),
         })
         const message = err instanceof Error ? err.message : 'Mesaj gönderilirken bir hata oluştu.'
         setError(message)

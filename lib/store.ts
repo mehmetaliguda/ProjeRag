@@ -82,7 +82,7 @@ interface AppStore {
   getCurrentConversation: () => Conversation | null
 
   // Message actions
-  addMessage: (notebookId: string, conversationId: string, message: Message) => Promise<void>
+  addMessage: (notebookId: string, conversationId: string, message: Message) => void
   updateMessage: (notebookId: string, conversationId: string, messageId: string, content: string) => void
 
   // Document actions (notebook-global)
@@ -146,6 +146,33 @@ function scheduleSelectedRoomsSync(
   }, SELECTION_SYNC_DEBOUNCE_MS)
 
   selectionSyncTimers.set(conversationId, timer)
+}
+
+// "No response from server" hatasi hem gercek timeout'ta hem de backend henuz
+// ayakta olmadigi icin baglanti reddedildiginde (ECONNREFUSED) ayni mesaji
+// veriyor (bkz. api-client.ts handleError). Burada sadece bu tip "sunucuya
+// hic ulasilamadi" hatalarinda retry yapiyoruz; 4xx/5xx gibi backend'in fiilen
+// cevap verdigi durumlarda (asagida throw edilen gercek API hatalari) hemen
+// vazgeciyoruz - onlari tekrar denemek bir seyi duzeltmez.
+async function withStartupRetry<T>(
+  fn: () => Promise<T>,
+  attempts = 4,
+  delayMs = 500
+): Promise<T> {
+  let lastErr: unknown
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn()
+    } catch (err) {
+      lastErr = err
+      const isUnreachable =
+        err instanceof Error && err.message.includes('No response from server')
+      const isLastAttempt = i === attempts - 1
+      if (!isUnreachable || isLastAttempt) throw err
+      await new Promise((resolve) => setTimeout(resolve, delayMs * (i + 1)))
+    }
+  }
+  throw lastErr
 }
 
 export const useAppStore = create<AppStore>()(
@@ -293,37 +320,40 @@ export const useAppStore = create<AppStore>()(
       },
 
       // Message actions
-      addMessage: async (notebookId: string, conversationId: string, message: Message) => {
-        const { useServerSync } = get()
+      addMessage: (notebookId: string, conversationId: string, message: Message) => {
+  const { useServerSync } = get()
 
-        // POST /conversations/<conv_id>/messages -> lokal state ancak basari sonrasi guncellenir
-        if (useServerSync) {
-          await ragClient.addMessage(conversationId, {
-            role: message.role,
-            content: message.content,
-          })
-        }
+  set((state) => ({
+    notebooks: state.notebooks.map((nb) =>
+      nb.id === notebookId
+        ? {
+            ...nb,
+            conversations: nb.conversations.map((c) =>
+              c.id === conversationId
+                ? {
+                    ...c,
+                    messages: [...c.messages, message],
+                    updatedAt: new Date(),
+                  }
+                : c
+            ),
+            updatedAt: new Date(),
+          }
+        : nb
+    ),
+  }))
 
-        set((state) => ({
-          notebooks: state.notebooks.map((nb) =>
-            nb.id === notebookId
-              ? {
-                  ...nb,
-                  conversations: nb.conversations.map((c) =>
-                    c.id === conversationId
-                      ? {
-                          ...c,
-                          messages: [...c.messages, message],
-                          updatedAt: new Date(),
-                        }
-                      : c
-                  ),
-                  updatedAt: new Date(),
-                }
-              : nb
-          ),
-        }))
-      },
+  if (useServerSync && message.role === 'user') {
+    ragClient
+      .addMessage(conversationId, {
+        role: message.role,
+        content: message.content,
+      })
+      .catch((err) => {
+        console.error('[store.addMessage] server sync failed:', err)
+      })
+  }
+},
 
       updateMessage: (notebookId: string, conversationId: string, messageId: string, content: string) => {
         set((state) => ({
@@ -647,7 +677,13 @@ export const useAppStore = create<AppStore>()(
       clearSyncWarning: () => set({ syncWarning: null }),
 
 loadFromServer: async () => {
-  const serverNotebooks = await ragClient.getNotebooks()
+  // Uygulama acilir acilmaz (onRehydrateStorage) tetiklenen ilk cagri, backend
+  // henuz portu dinlemeye baslamadan atilabiliyor (dev ortaminda Next.js
+  // genelde Flask'tan once ayaga kalkiyor). Bu durumda getNotebooks()
+  // ECONNREFUSED ile patlar. Bu tamamen bir "kim once ayaga kalkti" yarisi,
+  // gercek bir hata degil - o yuzden sadece "sunucuya hic ulasilamadi" tipi
+  // hatalarda, kisa araliklarla birkac kez sessizce tekrar deniyoruz.
+  const serverNotebooks = await withStartupRetry(() => ragClient.getNotebooks())
 
   const notebooks: Notebook[] = await Promise.all(
     serverNotebooks.map(async (nb) => {

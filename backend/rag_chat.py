@@ -24,9 +24,6 @@ from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_chroma import Chroma
-from langchain_community.document_loaders import PyMuPDFLoader, TextLoader, Docx2txtLoader
-from pptx import Presentation  # unstructured yerine: onnx/pdfminer/poppler gibi agir
-                                # bagimliliklari yok, sadece pptx okumak icin python-pptx yeterli
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage
@@ -34,11 +31,13 @@ from dotenv_rag import load_dotenv
 
 from query_optimizer import QueryOptimizer
 from hybrid_retriever import HybridRetriever, CrossEncoderReranker
+# Dokumandan metin/OCR cikarma ve format-ne-olursa-olsun-PDF-onizleme
+# mantiginin TAMAMI ocr_utils.py'de - burada format-spesifik loader/OCR
+# importu YOK, sadece bu moduldeki hazir fonksiyonlar kullaniliyor.
+from ocr_utils import extract_documents, extract_pdf_page_text, generate_preview_pdf, ALLOWED_EXT, IMAGE_EXTS
 
 from database import db
 from models import Room
-import subprocess
-import tempfile
 
 load_dotenv()
 
@@ -57,7 +56,7 @@ USE_QUERY_OPTIMIZER = True
 OLLAMA_LLM_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
-llm = ChatOllama(model=OLLAMA_LLM_MODEL, base_url=OLLAMA_BASE_URL, temperature=0)
+llm = ChatOllama(model=OLLAMA_LLM_MODEL, base_url=OLLAMA_BASE_URL, temperature=16384)
 
 
 class _CachedEmbeddings:
@@ -104,85 +103,9 @@ def safe_dirname(name: str) -> str:
     base = re.sub(r"[\\/:*?\"<>|]", "_", base)
     return base or "default"
 
-class _PptxLoader:
-    """Docx2txtLoader/TextLoader ile ayni sozlesme: .load() -> List[Document]."""
-
-    def __init__(self, file_path: str):
-        self.file_path = file_path
-
-    def load(self) -> List[Document]:
-        prs = Presentation(self.file_path)
-        docs = []
-        for i, slide in enumerate(prs.slides):
-            lines = []
-            for shape in slide.shapes:
-                if shape.has_text_frame:
-                    for para in shape.text_frame.paragraphs:
-                        line = "".join(run.text for run in para.runs)
-                        if line.strip():
-                            lines.append(line)
-            slide_text = "\n".join(lines).strip()
-            if slide_text:
-                docs.append(Document(page_content=slide_text, metadata={"page": i}))
-        return docs
-
-def _convert_legacy_office(file_path: str, target_ext: str) -> str:
-    """.doc -> .docx / .ppt -> .pptx icin LibreOffice headless donusturme.
-    Basarisizsa RuntimeError firlatir, caller (_get_loader) bunu yakalayip
-    anlamli bir hata mesaji verir."""
-    tmpdir = tempfile.mkdtemp(prefix="legacy_office_")
-    try:
-        result = subprocess.run(
-            [
-                "soffice", "--headless", "--norestore",
-                "--convert-to", target_ext.lstrip("."),
-                "--outdir", tmpdir,
-                file_path,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"LibreOffice donusturme basarisiz (code={result.returncode}): "
-                f"{result.stderr.strip()}"
-            )
-        base_name = os.path.splitext(os.path.basename(file_path))[0]
-        converted_path = os.path.join(tmpdir, f"{base_name}{target_ext}")
-        if not os.path.exists(converted_path):
-            raise RuntimeError(
-                f"Donusturme sonrasi beklenen dosya bulunamadi: {converted_path}"
-            )
-        return converted_path
-    except FileNotFoundError:
-        raise RuntimeError(
-            "LibreOffice (soffice) sistemde kurulu degil. "
-            "'sudo apt-get install -y libreoffice' ile kur."
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("LibreOffice donusturme zaman asimina ugradi (60sn).")
-
-def _get_loader(file_path: str):
-    """Uzantiya gore .load() -> List[Document] dondüren loader secer.
-    .doc/.ppt (eski binary OLE2 format) icin once LibreOffice ile
-    .docx/.pptx'e donusturulur, sonra ayni loader'lar kullanilir."""
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".pdf":
-        return PyMuPDFLoader(file_path)
-    if ext in (".md", ".txt"):
-        return TextLoader(file_path, encoding="utf-8")
-    if ext == ".docx":
-        return Docx2txtLoader(file_path)
-    if ext == ".doc":
-        converted = _convert_legacy_office(file_path, ".docx")
-        return Docx2txtLoader(converted)
-    if ext == ".pptx":
-        return _PptxLoader(file_path)
-    if ext == ".ppt":
-        converted = _convert_legacy_office(file_path, ".pptx")
-        return _PptxLoader(converted)
-    raise ValueError(f"Desteklenmeyen dosya formati: {ext}")
+# Format-spesifik loader'lar (_PptxLoader), legacy .doc/.ppt donusturme ve
+# uzantiya-gore-loader-secme mantigi ocr_utils.py'ye tasindi (bkz.
+# ocr_utils.extract_documents / ocr_utils._get_loader).
 
 # ------------------------------------------------------------------
 # Kaynak-etiketleme prompt'u ve [[c:N]] parse mantigi TEK yerde
@@ -199,12 +122,19 @@ def _build_citation_prompt(context: str, question: str, history: str = "", multi
     if multi_source:
         synthesis_block = (
             "ONEMLI - COKLU KAYNAK SENTEZI KURALI:\n"
-            "Asagidaki belge baglaminda birden fazla farkli PDF/kaynaktan gelen bilgi var. "
+            "Asagidaki belge baglaminda BIRDEN FAZLA FARKLI PDF/kaynaktan gelen bilgi var "
+            "(ayni PDF'ten gelen birbirine cok yakin/ortusen parcalar zaten tek aday olarak "
+            "birlestirildi - yani burada gordugun her farkli kaynak numarasi gercekten "
+            "BAGIMSIZ bir PDF/belgeyi temsil ediyor).\n"
             "Cevabini SADECE en baskin, en uzun veya ilk siradaki kaynaga dayandirma. "
-            "Farkli kaynaklardaki ilgili bilgileri birbiriyle iliskilendirerek TEK ve "
-            "butuncul bir cevap olustur; konuyla ilgisi olan her kaynaktan faydalan. "
-            "Kaynaklar birbirini tamamliyorsa bunu birlikte anlat, birbiriyle celisiyorsa "
-            "bu farki acikca belirt.\n\n"
+            "Konuyla ilgisi olan HER FARKLI kaynaktan faydalan:\n"
+            "- Iki (veya daha fazla) FARKLI kaynak AYNI konuda birbirini tamamlayan/destekleyen "
+            "bilgi veriyorsa, bunlari AYRI CUMLELERDE ama birbirine BAGLI sekilde anlat "
+            "(once bir kaynaktaki bilgiyi ver, sonra 'buna ek olarak', 'ayrica', 'bununla "
+            "birlikte' gibi baglaclarla diger kaynaktaki bilgiyi ekle) - ikisini tek cumlede "
+            "harmanlayip hangi bilginin hangi kaynaktan geldigini belirsizlestirme.\n"
+            "- Kaynaklar birbiriyle celisiyorsa bu farki acikca belirt.\n"
+            "- Bir kaynak soruyla ilgisizse onu zorla cevaba sokma.\n\n"
         )
     return (
         f"{history_block}"
@@ -303,39 +233,6 @@ class RagRoom:
         raw = f"{room_id}|{source}|{page}|{content}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    def _ocr_fallback_for_pages(self, page_nums: List[int]) -> Dict[int, str]:
-        """Taranmis (metin katmani yok/az) sayfalar icin Falcon-OCR fallback.
-
-        page_nums bos ise FalconOCR HIC yuklenmez (VRAM'e dokunulmaz).
-        Doluysa TEK bir `with FalconOCR() as ocr:` blogu icinde listedeki
-        TUM sayfalar sirayla islenir - her sayfa icin ayri context acip
-        kapatmak hem yavas olur hem gereksiz yukleme/indirme dongusu
-        yaratir, o yuzden yukleme/indirme tam olarak bu metodun basinda/
-        sonunda bir kere olur."""
-        if not page_nums:
-            return {}
-
-        import fitz
-        from PIL import Image
-        from ocr_utils import FalconOCR
-
-        results: Dict[int, str] = {}
-        print(f"[{self.room_id}] OCR modeli yukleniyor ({len(page_nums)} sayfa icin)")
-        with FalconOCR() as ocr:
-            with fitz.open(self.pdf_path) as doc:
-                for page_num in page_nums:
-                    if page_num < 0 or page_num >= len(doc):
-                        continue
-                    pix = doc[page_num].get_pixmap(dpi=200)
-                    image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                    try:
-                        results[page_num] = ocr.extract_text(image, mode="plain")
-                    except Exception as e:
-                        print(f"[{self.room_id}] OCR hatasi (sayfa {page_num}): {e}")
-                        results[page_num] = ""
-        print(f"[{self.room_id}] OCR modeli indirildi, VRAM bosaltildi")
-        return results
-
     def index_source(self, force: bool = False):
         if force and os.path.exists(self.chroma_dir):
             print(f"[{self.room_id}] force=True, chroma_db siliniyor.")
@@ -350,49 +247,21 @@ class RagRoom:
                 return
 
         ext = os.path.splitext(self.pdf_path)[1].lower()
-        IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
-        if ext == ".pdf":
-            # PyMuPDFLoader ile once normal metni cikar, sonra taranmis
-            # (metin katmani yok/az) sayfalari tespit et: strip() sonrasi
-            # 20 karakterden az metin -> OCR'a dusecek aday sayfa.
-            loader = PyMuPDFLoader(self.pdf_path)
-            docs = loader.load()
-            ocr_page_nums = [
-                d.metadata.get("page", i)
-                for i, d in enumerate(docs)
-                if len(d.page_content.strip()) < 20
-            ]
-            if ocr_page_nums:
-                ocr_texts = self._ocr_fallback_for_pages(ocr_page_nums)
-                for d in docs:
-                    page = d.metadata.get("page")
-                    ocr_text = ocr_texts.get(page)
-                    if ocr_text:
-                        d.page_content = ocr_text
-        elif ext in IMAGE_EXTS:
-            # Dogrudan resim yuklemesi: _get_loader() dispatch'ine girmez,
-            # tek resim TEK bir FalconOCR context'i icinde OCR'lanir
-            # (job sonunda otomatik indirilir), sonra normal splitter'dan
-            # gecirilir. "Sayfa" kavrami yok, page=0 sabit kalir (bkz.
-            # asagidaki chunk dongusu).
-            from PIL import Image
-
-            print(f"[{self.room_id}] OCR modeli yukleniyor (1 sayfa icin)")
-            from ocr_utils import FalconOCR
-            with FalconOCR() as ocr:
-                image = Image.open(self.pdf_path).convert("RGB")
-                try:
-                    ocr_text = ocr.extract_text(image, mode="plain")
-                except Exception as e:
-                    print(f"[{self.room_id}] OCR hatasi: {e}")
-                    ocr_text = ""
-            print(f"[{self.room_id}] OCR modeli indirildi, VRAM bosaltildi")
-            docs = [Document(page_content=ocr_text, metadata={"page": 0})] if ocr_text.strip() else []
-        else:
-            loader = _get_loader(self.pdf_path)
-            docs = loader.load()
-
+        # Metin/OCR cikarma islerinin TAMAMI ocr_utils.extract_documents()'e
+        # devredildi: PDF'te taranmis-sayfa tespiti + Falcon-OCR fallback,
+        # resimlerde tam-sayfa OCR, diger formatlarda format-spesifik loader
+        # - hepsi tek bir yerde (bkz. ocr_utils.py modul docstring'i).
+        docs = extract_documents(self.pdf_path, room_id=self.room_id)
+        print(f"""dökuman içeriği kontrolu:
+        -----------------------------------------------------------------------------------------------
+        -----------------------------------------------------------------------------------------------
+        {docs}
+        -----------------------------------------------------------------------------------------------
+        -----------------------------------------------------------------------------------------------        
+        
+        
+        """)
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200,
@@ -447,20 +316,8 @@ class RagRoom:
             return None
         ext = os.path.splitext(self.pdf_path)[1].lower()
         if ext == ".pdf":
-            try:
-                import fitz
-                with fitz.open(self.pdf_path) as doc:
-                    if page_num < 0 or page_num >= len(doc):
-                        return None
-                    text = doc[page_num].get_text().strip()
-                    if not text:
-                        return None
-                    if len(text) > max_chars:
-                        text = text[:max_chars] + "..."
-                    return text
-            except Exception as e:
-                print(f"[{self.room_id}] Sayfa metni okunamadi (sayfa {page_num}): {e}")
-                return None
+            # fitz-tabanli PDF sayfa metni cikarma ocr_utils.extract_pdf_page_text'e tasindi.
+            return extract_pdf_page_text(self.pdf_path, page_num, max_chars=max_chars)
         else:
             # PDF disi formatlarda page = sequential chunk_index; o chunk'in
             # icerigini vectorstore'dan cekiyoruz (fitz.open DENENMEZ).
@@ -485,6 +342,27 @@ class RagRoom:
         )
         result = llm.invoke(prompt).content.strip().lower()
         return "evet" in result
+
+    # ✅ BU METODU BURAYA EKLEYİN:
+    def _is_query_relevant_to_documents(self, question: str, documents: List[Document]) -> bool:
+        """Soru belgelerle ilgili mi? Sadece 'evet' veya 'hayır' döner."""
+        if not documents:
+            return False
+        
+        # Belgelerin özetini al (çok uzun olmaması için)
+        doc_summary = "\n".join([doc.page_content[:300] for doc in documents[:3]])
+        
+        prompt = (
+            "Aşağıdaki belge içeriği ile soru arasında bir ilişki var mı?\n"
+            "Sadece 'EVET' veya 'HAYIR' yanıtı ver.\n\n"
+            f"BELGE İÇERİĞİ:\n{doc_summary}\n\n"
+            f"SORU: {question}\n\n"
+            "YANIT:"
+        )
+        
+        result = llm.invoke(prompt).content.strip().upper()
+        return "EVET" in result
+    
 
     def _ensure_hybrid_initialized(self):
         """Hybrid retriever'in lazy-init mantigi (mevcut _retrieve icindeki
@@ -543,7 +421,21 @@ class RagRoom:
 
     def _generate(self, state: RAGState):
         question = state["messages"][-1].content
-
+        documents = state["documents"]
+        
+        # ✅ BELGE İLGİLİLİK KONTROLÜ - BURAYA EKLEYİN
+        if not self._is_query_relevant_to_documents(question, documents):
+            return {
+                "messages": [AIMessage(
+                    content="❌ SADECE BELGE İÇERİĞİNE GÖRE CEVAP VEREBİLİRİM!\n\n"
+                            "Bu sistem sadece yüklediğiniz PDF/dokümanlardaki bilgilere dayanarak yanıt üretir. "
+                            "Lütfen belgelerle ilgili spesifik bir soru sorun. "
+                            "Örneğin: 'Projenin bütçesi nedir?', 'Şirket politikası ne diyor?' gibi."
+                )],
+                "citations": {}
+            }
+        
+        # ESKİ KOD DEVAM EDİYOR:
         source_map, numbered_docs, seen_pages = {}, [], set()
         for doc in state["documents"]:
             page = doc.metadata.get("page", -1)
@@ -630,62 +522,95 @@ class RagRoom:
     def to_dict(self):
         return {"id": self.room_id, "name": self.display_name}
 
+    def get_preview_pdf_path(self) -> Optional[str]:
+        """Frontend'in "PDF olarak indir/goruntule" akisi icin: kaynak hangi
+        formatta olursa olsun (docx/pptx/resim/...) TEK bir PDF dosyasinin
+        yolunu doner. create_room_from_upload sirasinda generate_preview_pdf()
+        ile uretilip room_dir/preview.pdf olarak yazilir; uretim basarisiz
+        olduysa (ornegin LibreOffice kurulu degilse) dosya yoktur ve None
+        doner - caller (Flask route) bunu 404'e cevirebilir."""
+        preview_path = os.path.join(self.room_dir, "preview.pdf")
+        return preview_path if os.path.exists(preview_path) else None
+
 
 class RoomManager:
     """Butun RagRoom'lari sure boyunca RAM'de tutar; oda kayitlari DB'de (Room modeli)."""
-
+ 
     def __init__(self):
         os.makedirs(ROOMS_ROOT, exist_ok=True)
         self._rooms: Dict[str, RagRoom] = {}
         self._mssql_sources: Dict[int, "MssqlSource"] = {}
-
+ 
     def get_mssql_source(self, notebook_id: int) -> "MssqlSource":
         """Notebook'a bagli canli MSSQL kaynagini getirir (RAM'de cache'li).
         get_room ile ayni sozlesme: config yoksa FileNotFoundError firlatir."""
         if notebook_id in self._mssql_sources:
             return self._mssql_sources[notebook_id]
-
+ 
         from models import MSSQLConfig
-        config = MSSQLConfig.query.filter_by(notebook_id=notebook_id).first()
-        if config is None:
+        config_row = MSSQLConfig.query.filter_by(notebook_id=notebook_id).first()
+        if config_row is None:
             raise FileNotFoundError(
                 f"Bu notebook icin MSSQL konfigurasyonu bulunamadi: {notebook_id}"
             )
-
+ 
+        # ORM nesnesini oldugu gibi saklamiyoruz: istek/session kapaninca
+        # "Instance is not bound to a Session" hatasi veriyordu (SQLAlchemy
+        # expired-attribute + detached instance). Bunun yerine ihtiyac
+        # duyulan alanlari, session hala canliyken, duz bir SimpleNamespace'e
+        # KOPYALAYIP onu cache'liyoruz - artik session yasam dongusune
+        # bagimli degil, ikinci/ucuncu istekte de sorunsuz calisir.
+        config = SimpleNamespace(
+            server=config_row.server,
+            port=config_row.port,
+            database_name=config_row.database_name,
+            username=config_row.username,
+            password_encrypted=config_row.password_encrypted,
+            table_name=config_row.table_name,
+            timestamp_column=config_row.timestamp_column,
+            text_columns=list(config_row.text_columns or []),
+            max_context_tokens=getattr(config_row, "max_context_tokens", None),
+            reserved_output_tokens=getattr(config_row, "reserved_output_tokens", None),
+            max_retrieval_tokens=getattr(config_row, "max_retrieval_tokens", None),
+            max_retrieval_chars=getattr(config_row, "max_retrieval_chars", None),
+            fetch_batch_size=getattr(config_row, "fetch_batch_size", None),
+            max_rows=getattr(config_row, "max_rows", None),
+        )
+ 
         from mssql_source import MssqlSource
         source = MssqlSource(notebook_id=notebook_id, config=config)
         self._mssql_sources[notebook_id] = source
         return source
-
+ 
     def invalidate_mssql_source(self, notebook_id: int) -> None:
         """MSSQL config guncellenince/silinince cache'teki eski instance'i temizler."""
         self._mssql_sources.pop(notebook_id, None)
-
+ 
     def list_rooms(self):
         rows = Room.query.order_by(Room.created_at).all()
         return [{"id": row.id, "name": row.display_name} for row in rows]
-
+ 
     def get_room(self, room_id: str) -> RagRoom:
         if room_id in self._rooms:
             return self._rooms[room_id]
-
+ 
         row = Room.query.get(room_id)
         if row is None:
             raise FileNotFoundError(f"Oda bulunamadi: {room_id}")
-
+ 
         room = RagRoom(room_id, row.pdf_path, display_name=row.display_name, notebook_id=row.notebook_id)
         self._rooms[room_id] = room
         return room
-
+ 
     def delete_room(self, room_id: str) -> None:
         row = Room.query.get(room_id)
         if row is None and room_id not in self._rooms:
             raise FileNotFoundError(f"Oda bulunamadi: {room_id}")
-
+ 
         notebook_id = row.notebook_id if row is not None else getattr(self._rooms.get(room_id), "notebook_id", None)
-
+ 
         room = self._rooms.pop(room_id, None)
-
+ 
         # Chroma'nin sqlite dosyasini acik tutan client'i kapatmadan
         # rmtree denemek dosyayi kilitli birakip sessizce basarisiz oluyordu.
         if room is not None and hasattr(room, "vectorstore"):
@@ -694,9 +619,8 @@ class RoomManager:
             except Exception as e:
                 print(f"[delete_room] chroma client kapatilamadi: {e}")
         del room
-        import gc
         gc.collect()
-
+ 
         room_dir = (
             os.path.join(ROOMS_ROOT, str(notebook_id), room_id)
             if notebook_id is not None
@@ -708,30 +632,46 @@ class RoomManager:
             except Exception as e:
                 print(f"[delete_room] KLASOR SILINEMEDI: {room_dir} -> {e}")
                 raise  # frontend'e 500 dönsün, sessizce yutmayalim
-
+ 
         if row is not None:
             db.session.delete(row)
             db.session.commit()
-
+ 
     def create_room_from_upload(self, tmp_pdf_path: str, display_name: str, notebook_id: Optional[int] = None) -> RagRoom:
+        ext = os.path.splitext(tmp_pdf_path)[1].lower()
+        if ext not in ALLOWED_EXT:
+            raise ValueError(
+                f"Desteklenmeyen dosya formati: {ext} (izin verilenler: {sorted(ALLOWED_EXT)})"
+            )
+ 
         base_id = safe_dirname(display_name)
         room_id = base_id
         suffix = 1
         while Room.query.get(room_id) is not None:
             suffix += 1
             room_id = f"{base_id}_{suffix}"
-
+ 
         room_dir = (
             os.path.join(ROOMS_ROOT, str(notebook_id), room_id)
             if notebook_id is not None
             else os.path.join(ROOMS_ROOT, room_id)
         )
         os.makedirs(room_dir, exist_ok=True)
-        ext = os.path.splitext(tmp_pdf_path)[1].lower()
         permanent_pdf_path = os.path.join(room_dir, f"source{ext}")
         shutil.copy(tmp_pdf_path, permanent_pdf_path)
         image_dir = os.path.join(room_dir, "images")
-
+ 
+        # Kaynak hangi formatta olursa olsun frontend'e TEK bir PDF
+        # sunabilmek icin "ekran goruntusu" mantiginda bir onizleme PDF'i
+        # uretilir (bkz. RagRoom.get_preview_pdf_path). Basarisiz olursa
+        # upload'u DUSURMEZ, sadece o oda icin PDF indirme/onizleme
+        # butonu calismaz (log'a yazilir).
+        preview_pdf_path = os.path.join(room_dir, "preview.pdf")
+        try:
+            generate_preview_pdf(permanent_pdf_path, preview_pdf_path)
+        except Exception as e:
+            print(f"[{room_id}] Onizleme PDF'i uretilemedi: {e}")
+ 
         new_room = Room(
             id=room_id,
             display_name=display_name,
@@ -741,7 +681,7 @@ class RoomManager:
         )
         db.session.add(new_room)
         db.session.commit()
-
+ 
         room = RagRoom(room_id, permanent_pdf_path, display_name=display_name, notebook_id=notebook_id)
         self._rooms[room_id] = room
         return room
@@ -782,6 +722,70 @@ def _select_balanced_candidates(reranked: List[Dict], top_k: int, room_ids: List
 
     selected.sort(key=lambda d: d.get("rerank_score", 0), reverse=True)
     return selected[:top_k]
+
+
+def _jaccard_similarity(text_a: str, text_b: str) -> float:
+    """Basit kelime-kumesi Jaccard benzerligi (0-1).
+
+    Ayni PDF'ten gelen iki chunk'in birbirine ne kadar yakin/ortusen
+    oldugunu ucuz bir sekilde olcmek icin kullanilir (embedding/LLM
+    cagrisi gerektirmez)."""
+    words_a = set(text_a.lower().split())
+    words_b = set(text_b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    union = words_a | words_b
+    if not union:
+        return 0.0
+    return len(words_a & words_b) / len(union)
+
+
+# Bu esigin ustundeki, AYNI room_id'den gelen cift "yakin/ortusen" sayilir.
+NEAR_DUPLICATE_SIMILARITY_THRESHOLD = 0.55
+
+
+def _merge_near_duplicate_chunks(results: List[Dict]) -> List[Dict]:
+    """Ayni odadan (ayni PDF'ten) gelen, birbirine cok yakin/ortusen
+    chunk'lari tek adaya indirger.
+
+    Neden: 'iki farkli PDF'te de ilgili cevap varsa ikisi de ayri-ama-bagli
+    anlatilsin, ama ayni PDF'ten 2 chunk birbirine yakinsa buna gerek yok'
+    kurali. Bu fonksiyon calismadan once ayni odadan 2-3 neredeyse ayni
+    chunk balanced-selection'da o odanin taban slotlarini gereksiz yere
+    doldurup baska bir PDF'in disarida kalmasina yol acabiliyordu; ayrica
+    LLM'e ayni bilgiyi 2 kere farkli kaynak numarasiyla gosterip cevapta
+    gereksiz tekrara/sahte-coklu-kaynak izlenimine neden olabiliyordu.
+
+    Skoru en yuksek olan aday tutulur, ona yakin olan digerleri elenir.
+    FARKLI room_id'lerden gelen adaylar birbiriyle KARSILASTIRILMAZ (o
+    karar zaten ayri kaynak oldugu icin dogru, cevapta ayri-bagli
+    islenmesi gerekiyor - bkz. _build_citation_prompt).
+    """
+    if not results:
+        return results
+
+    by_room: Dict[str, List[Dict]] = defaultdict(list)
+    for item in results:
+        by_room[item.get("room_id")].append(item)
+
+    merged: List[Dict] = []
+    for room_id, items in by_room.items():
+        # O odanin adaylari genel listede karisik sirada olabilir, skora
+        # gore tekrar sirala ki en iyi temsilci tutulsun.
+        items = sorted(items, key=lambda d: d.get("rerank_score", d.get("score", 0)), reverse=True)
+        kept: List[Dict] = []
+        for cand in items:
+            cand_content = cand.get("content", "")
+            is_near_duplicate = any(
+                _jaccard_similarity(cand_content, existing.get("content", "")) >= NEAR_DUPLICATE_SIMILARITY_THRESHOLD
+                for existing in kept
+            )
+            if not is_near_duplicate:
+                kept.append(cand)
+        merged.extend(kept)
+
+    merged.sort(key=lambda d: d.get("rerank_score", d.get("score", 0)), reverse=True)
+    return merged
 
 
 def _resolve_source(room_id: str):
@@ -835,6 +839,16 @@ def get_multi_room_answer(room_ids: List[str], mesaj: str) -> dict:
     print(f"[multi-room] esik ({MULTI_ROOM_MIN_RERANK_SCORE}) sonrasi oda basina "
           f"hayatta kalan aday sayisi: {dict(by_room_count)}")
 
+    # Ayni PDF'ten (ayni room_id) gelen, birbirine cok yakin/ortusen chunk'lari
+    # tek adaya indirger - boylece balanced-selection'da tek bir odanin
+    # neredeyse ayni bilgiyi tekrar eden chunk'lari slot israf etmez ve baska
+    # bir PDF'in de goz onune alinmasina yer acilir. Farkli room_id'ler
+    # birbiriyle KARSILASTIRILMAZ, sadece ayni oda icinde eleme yapilir.
+    before_merge_count = len(reranked_all)
+    reranked_all = _merge_near_duplicate_chunks(reranked_all)
+    print(f"[multi-room] ayni-oda yakin-chunk birlestirme: {before_merge_count} -> "
+          f"{len(reranked_all)} aday")
+
     reranked = _select_balanced_candidates(reranked_all, top_k, room_ids)
     print(f"[multi-room] balanced secim sonrasi oda basina: "
           f"{ {rid: sum(1 for it in reranked if it.get('room_id') == rid) for rid in room_ids} }")
@@ -885,6 +899,17 @@ def get_multi_room_answer(room_ids: List[str], mesaj: str) -> dict:
         }
         numbered_docs.append((idx, page, room_id, doc))
 
+    # ✅ BELGE İLGİLİLİK KONTROLÜ - BURAYA EKLEYİN
+    # documents zaten tanımlı (yukarıda oluşturuldu)
+    if not any(doc.page_content.strip() for doc in documents):
+        return {
+            "text": "❌ SADECE BELGE İÇERİĞİNE GÖRE CEVAP VEREBİLİRİM!\n\n"
+                    "Bu sistem sadece yüklediğiniz PDF/dokümanlardaki bilgilere dayanarak yanıt üretir. "
+                    "Lütfen belgelerle ilgili spesifik bir soru sorun.",
+            "citations": {}
+        }
+
+    # ESKİ KOD DEVAM EDİYOR:
     if not numbered_docs:
         return {"text": "Belgede bu soruyla ilgili yeterli bilgi bulamadim.", "citations": {}}
 

@@ -44,8 +44,6 @@ export function SourcesPanel({ notebookId, conversationId }: SourcesPanelProps) 
   const hasDocuments = documents.length > 0
   const hasConversation = Boolean(conversationId)
 
-  // Bu notebook icin MSSQL kaynagi yapilandirilmis mi? Sanal kaynak satirini
-  // sadece configured ise gosteriyoruz.
   const [isMSSQLConfigured, setIsMSSQLConfigured] = useState(false)
   const mssqlSourceId = `mssql:${notebookId}`
 
@@ -67,25 +65,28 @@ export function SourcesPanel({ notebookId, conversationId }: SourcesPanelProps) 
     }
   }, [notebookId])
 
+  const hasSelectableSources = hasDocuments || isMSSQLConfigured
+  const isDisabled = Boolean(!hasConversation || !hasSelectableSources)
+
   return (
     <div className="h-full flex flex-col">
       <div className="flex-shrink-0 flex items-center justify-between px-3 py-2 border-b border-gray-100">
         <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500">Kaynaklar</h3>
         <div className="flex items-center gap-3">
           <button
-            onClick={() => hasConversation && selectAllDocuments(notebookId, conversationId)}
-            disabled={!hasConversation || !hasDocuments}
-            className="text-xs text-blue-600 hover:underline disabled:text-gray-300 disabled:no-underline"
-          >
-            Tümünü Seç
-          </button>
-          <button
-            onClick={() => hasConversation && clearDocumentSelection(notebookId, conversationId)}
-            disabled={!hasConversation || !hasDocuments}
-            className="text-xs text-blue-600 hover:underline disabled:text-gray-300 disabled:no-underline"
-          >
-            Seçimi Temizle
-          </button>
+    onClick={() => hasConversation && selectAllDocuments(notebookId, conversationId)}
+    disabled={isDisabled}
+    className="text-xs text-blue-600 hover:underline disabled:text-gray-300 disabled:no-underline"
+  >
+    Tümünü Seç
+  </button>
+  <button
+    onClick={() => hasConversation && clearDocumentSelection(notebookId, conversationId)}
+    disabled={isDisabled}
+    className="text-xs text-blue-600 hover:underline disabled:text-gray-300 disabled:no-underline"
+  >
+    Seçimi Temizle
+  </button>
         </div>
       </div>
 
