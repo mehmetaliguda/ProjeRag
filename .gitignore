@@ -14,3 +14,4 @@ node_modules
 .next/
 .DS_Storerag_rooms/
 rag_rooms/
+log/

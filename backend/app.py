@@ -13,6 +13,7 @@ import rag_chat  # room_manager zaten import ediliyor ama ROOMS_ROOT icin modulu
 from database import db, init_db
 from models import Notebook, Conversation, Message, Room, MSSQLConfig
 from mssql_crypto import encrypt_password
+from log_utils import log_request, get_client_ip
 
 app = Flask(__name__)
 CORS(app)
@@ -117,12 +118,17 @@ def delete_room(room_id):
 
 @app.route('/source-pdf/<room_id>')
 def serve_pdf(room_id):
+    room_row = Room.query.get(room_id)
+    notebook_id_for_log = room_row.notebook_id if room_row is not None else None
+
     try:
         room = room_manager.get_room(room_id)
     except FileNotFoundError:
+        log_request(get_client_ip(request), "(kaynak dosya bulunamadi)", room_id, notebook_id_for_log)
         return jsonify({"error": "Oda bulunamadi"}), 404
     directory = os.path.dirname(room.pdf_path)
     filename = os.path.basename(room.pdf_path)
+    log_request(get_client_ip(request), "(kaynak dosya goruntuleme)", room_id, notebook_id_for_log)
     return send_from_directory(directory, filename)
 
 
@@ -463,6 +469,20 @@ def chat():
                 print(f"[FLASK] Uyari: conversation_id={conversation_id} bulunamadi, mesaj kaydi atlanacak")
 
         print(f"[FLASK] Oda(lar): {', '.join(room_ids)} | Soru: {user_input}")
+
+        # notebook_id: oncelik conversation'dan; yoksa ilk room_id uzerinden
+        # tespit edilmeye calisilir (mssql:<notebook_id> veya Room tablosu).
+        notebook_id_for_log = conversation.notebook_id if conversation is not None else None
+        if notebook_id_for_log is None and room_ids:
+            first_room = room_ids[0]
+            if first_room.startswith("mssql:"):
+                notebook_id_for_log = first_room.split("mssql:", 1)[1]
+            else:
+                room_row = Room.query.get(first_room)
+                if room_row is not None:
+                    notebook_id_for_log = room_row.notebook_id
+
+        log_request(get_client_ip(request), user_input, room_ids, notebook_id_for_log)
 
         is_single_pdf_room = len(room_ids) == 1 and not room_ids[0].startswith("mssql:")
 

@@ -701,14 +701,36 @@ loadFromServer: async () => {
           status: 'ready',
         }))
 
-        const conversations: Conversation[] = serverConversations.map((c) => ({
-          id: c.id,
-          title: c.title,
-          messages: [],
-          selectedDocumentIds: c.selected_room_ids || [],
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        }))
+        // Her conversation'in mesaj gecmisini de backend'den cekiyoruz.
+        // Bir conversation'in mesajlari cekilemezse (agdaki hata vb.) o
+        // conversation bos mesaj listesiyle devam eder, diger conversation'lari
+        // etkilemez.
+        const conversations: Conversation[] = await Promise.all(
+          serverConversations.map(async (c) => {
+            let messages: Message[] = []
+            try {
+              const serverMessages = await ragClient.getMessages(c.id)
+              messages = serverMessages.map((m) => ({
+                id: m.id,
+                role: m.role as 'user' | 'assistant',
+                content: m.content,
+                timestamp: new Date(m.timestamp),
+                citations: m.citations,
+              }))
+            } catch (err) {
+              console.error(`[store] mesajlar yuklenemedi (conversation ${c.id}):`, err)
+            }
+
+            return {
+              id: c.id,
+              title: c.title,
+              messages,
+              selectedDocumentIds: c.selected_room_ids || [],
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            }
+          })
+        )
 
         return {
           id: nb.id,

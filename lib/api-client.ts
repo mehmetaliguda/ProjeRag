@@ -38,6 +38,7 @@ export interface ConversationMessage {
   role: string
   content: string
   timestamp: string
+  citations?: Record<string, CitationInfo>   // backend su an dondurmuyor, asagidaki nota bak
 }
 
 // Backend'deki room yapısı

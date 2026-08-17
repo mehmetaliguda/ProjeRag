@@ -107,18 +107,87 @@ class FalconOCR:
         self._loaded = False
 
     def _load(self):
+        """Modeli yukler. Eger model zaten cache'de varsa internet baglantisi kontrolu yapmaz."""
         if self._loaded:
             return
         import torch
         from transformers import AutoModelForCausalLM
+        import os
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_id,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-        )
-        self._loaded = True
+        # Yerel model dizini - modelin indirildigi yeri belirt
+        local_model_path = os.getenv("FALCON_OCR_LOCAL_PATH", "./models/falcon-ocr")
+
+        try:
+            # Once yerel dizinde kontrol et
+            if os.path.exists(local_model_path) and os.path.isdir(local_model_path):
+                print(f"Model yerel dizinden yukleniyor: {local_model_path}")
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    local_model_path,  # Yerel yol
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                    device_map="auto",
+                    local_files_only=True,  # Internet baglantisi kontrolu yapma
+                )
+            else:
+                # Yerel yoksa, cache'de var mi kontrol et
+                print(f"Model araniyor: {self.model_id} (yerel kopya yok, cache kontrol ediliyor)")
+                try:
+                    # Once cache'de var mi dene (internet baglantisi yoksa bile calisir)
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        self.model_id,
+                        trust_remote_code=True,
+                        torch_dtype=torch.bfloat16,
+                        device_map="auto",
+                        local_files_only=True,  # Sadece cache'de varsa yukle
+                    )
+                except Exception as cache_error:
+                    print(f"Model cache'de bulunamadi: {cache_error}")
+                    print(f"Model indiriliyor: {self.model_id} (cache'e kaydedilecek)")
+                    # Cache'e indir
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        self.model_id,
+                        trust_remote_code=True,
+                        torch_dtype=torch.bfloat16,
+                        device_map="auto",
+                        cache_dir=local_model_path,  # Bu dizine indir
+                    )
+                    # Indirdikten sonra yerel dosya olarak da kaydet
+                    try:
+                        self.model.save_pretrained(local_model_path)
+                        print(f"Model {local_model_path} dizinine kaydedildi")
+                    except Exception as save_error:
+                        print(f"Model kaydedilemedi: {save_error}")
+
+            self._loaded = True
+
+        except Exception as e:
+            print(f"Model yuklenirken hata: {e}")
+            # Son bir deneme: internetten indirmeyi dene
+            try:
+                print(f"Son deneme: model dogrudan indiriliyor: {self.model_id}")
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_id,
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                    device_map="auto",
+                )
+                self._loaded = True
+                # Yerel olarak kaydet
+                try:
+                    os.makedirs(local_model_path, exist_ok=True)
+                    self.model.save_pretrained(local_model_path)
+                    print(f"Model {local_model_path} dizinine kaydedildi")
+                except Exception:
+                    pass
+            except Exception as final_error:
+                raise RuntimeError(
+                    f"Falcon-OCR modeli yuklenemedi: {final_error}\n"
+                    "Modeli manuel olarak indirmek icin:\n"
+                    "  python -c \"from transformers import AutoModelForCausalLM; "
+                    "model = AutoModelForCausalLM.from_pretrained('tiiuae/Falcon-OCR', "
+                    "trust_remote_code=True); model.save_pretrained('./models/falcon-ocr')\"\n"
+                    "Veya internet baglantisini kontrol edin."
+                )
 
     def _unload(self):
         if not self._loaded:

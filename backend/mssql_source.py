@@ -126,7 +126,7 @@ class MssqlSource:
     MAX_FETCH_ATTEMPTS = 20
     DEFAULT_BATCH_SIZE = 200
     DEFAULT_MAX_ROWS = 2000
-    CONNECT_TIMEOUT_SECONDS = 5
+    CONNECT_TIMEOUT_SECONDS = 90
 
     def __init__(self, notebook_id: int, config):
         self.notebook_id = notebook_id

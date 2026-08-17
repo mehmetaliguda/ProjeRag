@@ -19,6 +19,10 @@ from collections import defaultdict
 from functools import lru_cache
 from typing import TypedDict, List, Annotated, Optional, Dict
 
+import gc
+
+from types import SimpleNamespace
+
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
@@ -56,7 +60,7 @@ USE_QUERY_OPTIMIZER = True
 OLLAMA_LLM_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
-llm = ChatOllama(model=OLLAMA_LLM_MODEL, base_url=OLLAMA_BASE_URL, temperature=16384)
+llm = ChatOllama(model=OLLAMA_LLM_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.2)
 
 
 class _CachedEmbeddings:
@@ -343,25 +347,34 @@ class RagRoom:
         result = llm.invoke(prompt).content.strip().lower()
         return "evet" in result
 
-    # ✅ BU METODU BURAYA EKLEYİN:
     def _is_query_relevant_to_documents(self, question: str, documents: List[Document]) -> bool:
-        """Soru belgelerle ilgili mi? Sadece 'evet' veya 'hayır' döner."""
+        """Soru belgelerle ilgili mi? Sadece 'evet' veya 'hayır' döner.
+
+        Bu metod artik SADECE hybrid retrieval/reranker devre disiyken (fallback
+        yolunda) cagriliyor - bkz. _generate. O yuzden burada kasten "yumusak"
+        davraniyoruz: dolayli/kismi ilgi de EVET sayilir, daha fazla ve daha uzun
+        belge parcasi gosteriyoruz ki model kararini az bilgiyle vermesin.
+        """
         if not documents:
             return False
-        
-        # Belgelerin özetini al (çok uzun olmaması için)
-        doc_summary = "\n".join([doc.page_content[:300] for doc in documents[:3]])
-        
+
+        # Once 3 yerine 5 belge, once 300 yerine 800 karakter - kucuk bir ozet
+        # yuzunden yanlislikla "ilgisiz" denmesin diye.
+        doc_summary = "\n---\n".join(doc.page_content[:800] for doc in documents[:5])
+
         prompt = (
-            "Aşağıdaki belge içeriği ile soru arasında bir ilişki var mı?\n"
-            "Sadece 'EVET' veya 'HAYIR' yanıtı ver.\n\n"
-            f"BELGE İÇERİĞİ:\n{doc_summary}\n\n"
+            "Asagida bir soru ve bir belgeden alinan parcalar var.\n"
+            "Soru, bu belge parcalarindaki konuyla DOGRUDAN, DOLAYLI ya da KISMEN "
+            "ilgiliyse EVET yaz. Sadece belgeyle hicbir ilgisi olmayan, tamamen "
+            "farkli/alakasiz bir konudaysa HAYIR yaz. Supheye dustugunde EVET yaz.\n"
+            "Sadece 'EVET' veya 'HAYIR' yaz, baska bir sey yazma.\n\n"
+            f"BELGE PARCALARI:\n{doc_summary}\n\n"
             f"SORU: {question}\n\n"
             "YANIT:"
         )
-        
+
         result = llm.invoke(prompt).content.strip().upper()
-        return "EVET" in result
+        return "HAYIR" not in result
     
 
     def _ensure_hybrid_initialized(self):
@@ -422,9 +435,18 @@ class RagRoom:
     def _generate(self, state: RAGState):
         question = state["messages"][-1].content
         documents = state["documents"]
-        
-        # ✅ BELGE İLGİLİLİK KONTROLÜ - BURAYA EKLEYİN
-        if not self._is_query_relevant_to_documents(question, documents):
+
+        # BELGE ILGILILIK KONTROLU
+        # USE_HYBRID_RETRIEVAL + USE_RERANKER acikken (varsayilan durum) belgeler
+        # zaten _retrieve() icinde reranker'in min_score esiginden gecmis oluyor -
+        # yani buraya gelen documents listesi zaten soruya alakali bulunmus demektir.
+        # Bu yuzden documents doluysa ikinci bir katı EVET/HAYIR LLM kontrolu
+        # YAPMIYORUZ (bu, alakali sorularda bile yanlislikla "hayir" deyip
+        # reddetmenin ana kaynagiydi). Sadece hic belge gelmediyse (reranker hicbir
+        # sey birakmadiysa) ya da hybrid/reranker kapaliysa (eski/basit yol) bu
+        # ek kontrolu calistiriyoruz.
+        needs_relevance_gate = (not documents) or not (USE_HYBRID_RETRIEVAL and USE_RERANKER)
+        if needs_relevance_gate and not self._is_query_relevant_to_documents(question, documents):
             return {
                 "messages": [AIMessage(
                     content="❌ SADECE BELGE İÇERİĞİNE GÖRE CEVAP VEREBİLİRİM!\n\n"

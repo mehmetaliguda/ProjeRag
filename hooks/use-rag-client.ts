@@ -78,20 +78,26 @@ export function useRagClient({ notebookId, conversationId }: UseRagClientOptions
         addMessage(notebookId, conversationId, assistantMessage)
         console.debug('[useRagClient] assistant message added to store')
       } catch (err) {
-        console.error('[useRagClient] sendMessage failed:', {
-          notebookId,
-          conversationId,
-          errType: typeof err,
-          errIsError: err instanceof Error,
-          errRaw: err,
-          errStringified: (() => {
-            try {
-              return JSON.stringify(err, Object.getOwnPropertyNames(err ?? {}))
-            } catch {
-              return 'stringify failed'
-            }
-          })(),
-        })
+  const anyErr = err as any
+  console.error('[useRagClient] sendMessage failed:', {
+    notebookId,
+    conversationId,
+    errType: typeof err,
+    errIsError: err instanceof Error,
+    errName: anyErr?.name,
+    errMessage: anyErr?.message,
+    isAxiosError: anyErr?.isAxiosError,
+    httpStatus: anyErr?.response?.status,
+    responseData: anyErr?.response?.data,
+    errRaw: err,
+    errStringified: (() => {
+      try {
+        return JSON.stringify(err, Object.getOwnPropertyNames(err ?? {}))
+      } catch {
+        return 'stringify failed'
+      }
+    })(),
+  })
         const message = err instanceof Error ? err.message : 'Mesaj gönderilirken bir hata oluştu.'
         setError(message)
 
