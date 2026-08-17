@@ -1,277 +1,287 @@
-# RAG Chat Frontend
+# RAG Sistemi (Çoklu Kaynak Destekli)
 
-A modern, NotebookLM-style web interface for interacting with a Retrieval-Augmented Generation (RAG) system built with Ollama and Flask.
+Bu proje, kullanıcıların yerel olarak çalıştırdığı bir **Retrieval-Augmented Generation (RAG)** sistemidir. PDF, Word, PowerPoint, resim, metin ve MSSQL veritabanı gibi çeşitli kaynakları kullanarak doğal dilde sorular sorabilir ve belgelere dayalı cevaplar alabilirsiniz.
 
-## Features
+Sistem tamamen **yerel** çalışır; LLM, embedding ve OCR modelleri **Ollama** ve **Hugging Face** üzerinden indirilir ve hiçbir veri dışarı gönderilmez.
 
-- **Multi-conversation support**: Create and manage multiple chat conversations simultaneously
-- **Document management**: Upload PDF/TXT/DOC/DOCX files and process them for Q&A
-- **Real-time chat**: Ask questions about your documents and get AI-powered responses
-- **Dark/Light themes**: Toggle between dark and light modes for comfortable viewing
-- **Responsive design**: Optimized for desktop and mobile devices
-- **Backend configuration**: Easily switch between different backend servers
-- **Message history**: Maintain full conversation history with timestamps
-- **Document tracking**: Monitor document upload status (uploading, processing, ready, error)
+---
 
-## Getting Started
+## İçindekiler
 
-### Prerequisites
+1. [Genel Mimari](#genel-mimari)
+2. [Kullanılan Teknolojiler ve Modeller](#kullanılan-teknolojiler-ve-modeller)
+3. [Kurulum](#kurulum)
+   - [Ön Gereksinimler](#ön-gereksinimler)
+   - [Backend Kurulumu](#backend-kurulumu)
+   - [Frontend Kurulumu](#frontend-kurulumu)
+   - [Ollama Model İndirme](#ollama-model-indirme)
+   - [Ortam Değişkenleri (.env)](#ortam-değişkenleri-env)
+4. [Çalıştırma](#çalıştırma)
+5. [Kullanım](#kullanım)
+   - [Notebook Oluşturma ve Dosya Yükleme](#notebook-oluşturma-ve-dosya-yükleme)
+   - [Soru Sorma (RAG)](#soru-sorma-rag)
+   - [MSSQL Veritabanı Bağlama](#mssql-veritabanı-bağlama)
+6. [Desteklenen Dosya Formatları](#desteklenen-dosya-formatları)
+7. [Sorun Giderme](#sorun-giderme)
+8. [Güvenlik Notları](#güvenlik-notları)
 
-- Node.js 18+ with pnpm
-- Flask backend running on `http://localhost:5000` (or custom URL)
+---
 
-### Installation
+## Genel Mimari
 
-1. Install dependencies:
+Proje iki ana bölümden oluşur:
+
+- **Frontend**: Next.js (React) tabanlı bir web arayüzü. Kullanıcı notebook’lar oluşturur, dosya yükler, sohbet eder ve MSSQL yapılandırması yapar.
+- **Backend**: Flask (Python) tabanlı REST API. RAG motoru, doküman indeksleme, vektör arama, MSSQL bağlantısı ve LLM ile cevap üretme işlemlerini yürütür.
+
+Backend içinde:
+- **SQLite** veritabanı (`app.db`) notebook, conversation, room ve MSSQL config bilgilerini saklar.
+- **Chroma** vektör veritabanı, her belge odası için ayrı bir klasörde vektörleri tutar.
+- **LangChain / LangGraph** RAG pipeline’ını yönetir.
+- **Hybrid Retriever** (BM25 + semantik arama) ve **CrossEncoderReranker** ile en alakalı parçalar seçilir.
+
+---
+
+## Kullanılan Teknolojiler ve Modeller
+
+| Amaç                     | Teknoloji / Model                                                                                              |
+|--------------------------|----------------------------------------------------------------------------------------------------------------|
+| **Web Framework (Backend)** | Flask 3.0                                                                                                     |
+| **Web Framework (Frontend)** | Next.js 16 + React 19 + Tailwind CSS 4                                                                        |
+| **Vektör Veritabanı**    | Chroma (langchain-chroma)                                                                                      |
+| **Embedding Modeli**     | `bge-m3` (OllamaEmbeddings ile, `bge-m3` modeli)                                                               |
+| **LLM (Cevap Üretimi)**  | `qwen2.5:7b-instruct` (Ollama ile, ayrıca query optimizer ve reranker’da da kullanılır)                        |
+| **OCR Modeli**           | `tiiuae/Falcon-OCR` (Hugging Face transformers, görüntü ve taranmış PDF’ler için)                              |
+| **PDF İşleme**           | PyMuPDF (fitz) + LangChain PyMuPDFLoader; taranmış sayfalar için Falcon-OCR fallback                           |
+| **Veritabanı**           | SQLite (Flask-SQLAlchemy)                                                                                      |
+| **MSSQL Bağlantısı**     | `pyodbc` + `ODBC Driver 18 for SQL Server`                                                                     |
+| **Şifreleme**            | Fernet (cryptography) ile MSSQL parolası şifrelenir                                                           |
+| **Dosya Dönüşümleri**    | LibreOffice (headless) eski .doc/.ppt ve .docx/.pptx’i PDF’e çevirir                                           |
+
+---
+
+## Kurulum
+
+### Ön Gereksinimler
+
+- **Python 3.10+** (backend)
+- **Node.js 20+** ve **pnpm** veya **npm** (frontend)
+- **Ollama** yüklü ve çalışır durumda ([ollama.com](https://ollama.com) adresinden indirilebilir)
+- **LibreOffice** – bazı dosya formatlarının PDF’e dönüştürülmesi için:
+  - Ubuntu/Debian: `sudo apt-get install -y libreoffice`
+  - Windows/macOS: [LibreOffice indirme](https://www.libreoffice.org/download/)
+- **ODBC Driver 18 for SQL Server** (MSSQL kullanacaksanız):
+  - Microsoft’un resmi kurulum talimatları: [Linux](https://learn.microsoft.com/sql/connect/odbc/linux-mac/installing-the-microsoft-odbc-driver-for-sql-server), [Windows](https://learn.microsoft.com/sql/connect/odbc/windows/system-requirements-installation-and-driver-files)
+- **Git** (opsiyonel)
+
+### Backend Kurulumu
+
 ```bash
-pnpm install
+cd backend
+python -m venv venv
+source venv/bin/activate      # Windows: venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-2. Start the development server:
+### Frontend Kurulumu
+
+Proje kök dizininde:
+
 ```bash
-pnpm dev
+pnpm install     # veya npm install
 ```
 
-3. Open `http://localhost:3000` in your browser
+### Ollama Model İndirme
 
-## Configuration
+Terminalde Ollama’yı başlatmadan önce gerekli modelleri indirin:
 
-### Backend URL
-
-The default backend URL is `http://127.0.0.1:5000`. To change it:
-
-1. Click on the backend URL in the header (e.g., "Backend: 127.0.0.1:5000")
-2. Enter your custom backend URL
-3. Click "Update"
-
-The URL is remembered throughout your session.
-
-## Project Structure
-
-```
-src/
-├── app/
-│   ├── layout.tsx          # Root layout with theme provider
-│   ├── page.tsx            # Main application page
-│   └── globals.css         # Global styles
-├── components/
-│   ├── sidebar.tsx         # Left sidebar with conversations
-│   ├── chat-panel.tsx      # Main chat area
-│   ├── message.tsx         # Individual message component
-│   ├── chat-input.tsx      # Message input with file upload
-│   ├── documents-list.tsx  # Document management
-│   └── theme-provider.tsx  # Theme management
-├── lib/
-│   ├── store.ts            # Zustand state management
-│   └── api-client.ts       # Flask backend client
+```bash
+ollama pull bge-m3
+ollama pull qwen2.5:7b-instruct
 ```
 
-## Key Components
+> **Not:** `bge-m3` embedding, `qwen2.5:7b-instruct` ise cevap üretimi ve yeniden sıralama için kullanılır. Model boyutları büyük olabilir (bge-m3 ~1.2GB, qwen2.5:7b ~4.7GB).
 
-### Zustand Store (`lib/store.ts`)
+OCR modeli **Ollama’da yoktur**, Hugging Face’ten otomatik indirilir (ilk kullanımda). İsterseniz manuel olarak da indirebilirsiniz:
 
-Centralized state management for:
-- Conversations and messages
-- Documents
-- Theme preference
-- Backend URL configuration
-
-### RAG API Client (`lib/api-client.ts`)
-
-Handles communication with the Flask backend:
-- **`POST /chat`** - Send a message and get responses
-- **`POST /upload`** - Upload documents
-- **`GET /documents`** - List all documents
-- **`POST /delete/<filename>`** - Delete a document
-- **`POST /reset`** - Clear context
-
-### Message Types
-
-**Message**:
-```typescript
-{
-  id: string
-  role: 'user' | 'assistant'
-  content: string
-  timestamp: Date
-}
+```bash
+python -c "from transformers import AutoModelForCausalLM; model = AutoModelForCausalLM.from_pretrained('tiiuae/Falcon-OCR', trust_remote_code=True); model.save_pretrained('./models/falcon-ocr')"
 ```
 
-**Document**:
-```typescript
-{
-  id: string
-  name: string
-  size: number
-  uploadedAt: Date
-  status: 'uploading' | 'processing' | 'ready' | 'error'
-}
+### Ortam Değişkenleri (.env)
+
+Backend, `backend/rag.env` dosyasından ayarları okur. Aşağıdaki içerikle bir `rag.env` oluşturun:
+
+```ini
+# Ollama ayarları
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5:7b-instruct
+
+# Embedding modeli
+EMBED_MODEL=bge-m3
+
+# Vektör veritabanı klasörü
+RAG_ROOMS_ROOT=./rag_rooms
+
+# MSSQL şifreleme anahtarı (Fernet)
+# Yeni anahtar üretmek için:
+# python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+MSSQL_ENC_KEY=buraya_uretilen_anahtar
+
+# MSSQL ODBC sürücüsü (varsayılan: ODBC Driver 18 for SQL Server)
+MSSQL_ODBC_DRIVER=ODBC Driver 18 for SQL Server
+
+# OCR modeli (opsiyonel)
+FALCON_OCR_MODEL_ID=tiiuae/Falcon-OCR
+FALCON_OCR_LOCAL_PATH=./models/falcon-ocr
+
+# İsteğe bağlı diğer ayarlar
+APP_BASE_URL=http://127.0.0.1:5000
+DATABASE_URL=sqlite:///app.db
 ```
 
-## Usage
+**Önemli:** `MSSQL_ENC_KEY` olmadan MSSQL bağlantısı kurulamaz. Boş bırakılırsa uygulama hata verir.
 
-### Starting a Conversation
+---
 
-1. Click "New Chat" in the sidebar to create a new conversation
-2. The new conversation becomes active immediately
+## Çalıştırma
 
-### Uploading Documents
+### 1. Ollama’yı başlatın
 
-1. Click the paperclip icon in the chat input area
-2. Select a PDF, TXT, DOC, or DOCX file
-3. The file will upload and process automatically
-4. Once ready, the document appears in the "Documents" section
-
-### Asking Questions
-
-1. Type your question in the input box
-2. Press Enter or click the send button
-3. The AI responds based on your uploaded documents
-4. Use Shift+Enter for multi-line messages
-
-### Managing Conversations
-
-- **Switch**: Click any conversation in the sidebar
-- **Delete**: Hover over a conversation and click the trash icon
-- **Rename**: Planned feature (future MSSQL UI integration)
-
-## Planned Features
-
-- Conversation renaming
-- Bulk document operations
-- MSSQL integration for persistent storage
-- Advanced search across documents
-- Document previews
-- Export conversation as PDF
-- Sharing capabilities
-
-## Backend API Requirements
-
-The Flask backend should implement these endpoints:
-
-### POST /chat
-Request:
-```json
-{
-  "query": "Your question here"
-}
+```bash
+ollama serve
 ```
 
-Response:
-```json
-{
-  "response": "AI generated answer",
-  "sources": [
-    {
-      "document": "filename.pdf",
-      "page": 1,
-      "excerpt": "Relevant text excerpt"
-    }
-  ]
-}
+Servisin çalıştığını kontrol etmek için:
+
+```bash
+curl http://localhost:11434
 ```
 
-### POST /upload
-Multipart form data with `file` field. Returns:
-```json
-{
-  "filename": "uploaded_file.pdf",
-  "size": 12345,
-  "uploaded_at": "2026-08-06T06:30:00Z"
-}
+veya tarayıcıda `http://localhost:11434` adresine gidin.
+
+### 2. Backend’i başlatın
+
+Yeni bir terminalde:
+
+```bash
+cd backend
+source venv/bin/activate   # Windows: venv\Scripts\activate
+flask --app app.py run
 ```
 
-### GET /documents
-Returns:
-```json
-{
-  "documents": [
-    {
-      "name": "file.pdf",
-      "size": 12345,
-      "uploaded_at": "2026-08-06T06:30:00Z"
-    }
-  ]
-}
+Backend varsayılan olarak `http://127.0.0.1:5000` adresinde dinler.
+
+### 3. Frontend’i başlatın
+
+Başka bir terminalde (proje kök dizininde):
+
+```bash
+npm run dev
 ```
 
-### POST /delete/<filename>
-Deletes a document. Returns 200 on success.
+veya
 
-### POST /reset
-Clears the RAG context. Returns 200 on success.
+```bash
+pnpm run dev
+```
 
-## Troubleshooting
+Frontend `http://localhost:3000` adresinde açılır.
 
-### Backend Connection Error
+---
 
-If you see "No response from server. Check if backend is running.":
+## Kullanım
 
-1. Verify the Flask backend is running on the configured URL
-2. Check the backend URL in the header
-3. Ensure CORS is enabled on your backend
-4. Check browser console for more details
+### Notebook Oluşturma ve Dosya Yükleme
 
-### Document Upload Failed
+1. Tarayıcıda `http://localhost:3000` adresine gidin.
+2. Sağ üstteki **“New Notebook”** butonuna tıklayın ve bir isim verin.
+3. Notebook’a tıklayarak sohbet sayfasına geçin.
+4. Sol panelde **“Kaynaklar”** bölümünden dosya sürükleyip bırakabilir veya **“Dosyaları buraya sürükleyin”** alanına tıklayıp dosya seçebilirsiniz.
+5. Yüklenen belgeler otomatik olarak vektör veritabanına eklenir ve **seçili** hale gelir. Birden fazla belgeyi seçerek aynı anda sorgulayabilirsiniz.
 
-1. Ensure file size is within limits (backend dependent)
-2. Check file format is supported (.pdf, .txt, .doc, .docx)
-3. Verify backend has write permissions
-4. Check disk space on server
+### Soru Sorma (RAG)
 
-### Theme Not Persisting
+- Sohbet ekranında sorunuzu yazın ve Enter’a basın.
+- Sistem, önce vektör araması yapar, en alakalı parçaları seçer ve **qwen2.5:7b-instruct** ile cevap üretir.
+- Cevaplarda `[[c:N]]` etiketleri ile kaynak gösterilir; tıklayarak alıntılanan sayfayı/metni görebilirsiniz.
 
-The theme preference is stored in localStorage. It will be remembered across sessions.
+### MSSQL Veritabanı Bağlama
 
-## Development
+MSSQL’i bir notebook’a bağlamak için:
 
-### Available Scripts
+1. Ana sayfadaki **“Data Sources”** bölümünde notebook’u seçin.
+2. **MSSQL Configuration** panelinde aşağıdaki alanları doldurun:
+   1. **Server** – Sunucu adı veya IP
+   2. **Port** – Genellikle 1433
+   3. **Database Name** – Veritabanı adı
+   4. **Username** – Kullanıcı adı
+   5. **Password** – Şifre (güncellemede boş bırakılırsa eski şifre korunur)
+   6. **Table Name** – Sorgulanacak tablo adı
+   7. **Timestamp Column** – Zaman damgası sütunu (en yeni kayıtların sıralanacağı sütun)
+   8. **Text Columns** – Metin içeren sütunlar (virgülle ayırın, ör. `message, level, source`)
+3. **“Save & Test Connection”** butonuna basın. Backend bağlantıyı test eder; başarılıysa kaydeder.
+4. Notebook’a gidin ve sohbet ekranında **“SQL Kaynağı”** adlı kaynağı seçin.
+5. Sorularınızı doğal dilde sorun; sistem hem belgelerden hem de MSSQL’den gelen verilerle cevap üretir.
 
-- `pnpm dev` - Start development server (hot reload enabled)
-- `pnpm build` - Build for production
-- `pnpm start` - Start production server
-- `pnpm lint` - Run ESLint
+---
 
-### Technologies Used
+## Desteklenen Dosya Formatları
 
-- **Framework**: Next.js 16 (App Router)
-- **UI**: shadcn/ui with Tailwind CSS
-- **State Management**: Zustand
-- **HTTP Client**: Axios
-- **Icons**: Lucide React
-- **Type Safety**: TypeScript
+Aşağıdaki formatlar yüklenebilir ve RAG’de kullanılabilir:
 
-## Browser Support
+```
+.pdf   .md    .txt   .docx  .pptx  .doc   .ppt
+.jpg   .jpeg  .png
+```
 
-- Chrome/Edge 90+
-- Firefox 88+
-- Safari 14+
-- Mobile browsers (iOS Safari, Chrome Mobile)
+- **PDF**: Metin katmanı varsa doğrudan okunur; taranmış/görüntü PDF’lerde Falcon-OCR devreye girer.
+- **Resimler**: Tam sayfa OCR ile metne çevrilir.
+- **Word/PowerPoint**: Metin ve gömülü resimler ayrı ayrı işlenir (resimler OCR’lanır).
+- **Eski .doc/.ppt**: LibreOffice ile .docx/.pptx’e dönüştürülüp işlenir.
 
-## Security Considerations
+---
 
-- Messages and documents are stored locally during the session
-- For persistence, implement backend storage (planned MSSQL integration)
-- All API calls use proper error handling and timeouts
-- File uploads are validated on backend
-- No sensitive data is hardcoded
+## Sorun Giderme
 
-## Future Improvements
+### Ollama bağlantı hatası
 
-- [ ] Persistent storage with MSSQL
-- [ ] Conversation persistence
-- [ ] User authentication
-- [ ] Collaboration features
-- [ ] Advanced search
-- [ ] Document preview
-- [ ] Conversation export
-- [ ] Voice input/output
-- [ ] Plugin system for custom integrations
+- `ollama serve` çalışıyor mu kontrol edin.
+- `OLLAMA_BASE_URL` doğru mu? Varsayılan `http://localhost:11434`.
+- Modeller indirildi mi? `ollama list` ile kontrol edin.
 
-## License
+### Backend başlamıyor
 
-MIT
+- `requirements.txt`’teki bağımlılıkların kurulduğundan emin olun.
+- `rag.env` dosyasının `backend/` dizininde olduğunu kontrol edin.
+- SQLite dosyası (`app.db`) oluşturulabilsin diye dizin yazma izni verin.
 
-## Support
+### MSSQL bağlantı hatası
 
-For issues or questions, please refer to the backend documentation or contact support.
+- `MSSQL_ENC_KEY` tanımlı ve geçerli bir Fernet anahtarı mı?
+- ODBC Driver 18 kurulu mu?
+- Sunucu, port, veritabanı adı ve tablo adı doğru mu?
+- Tablo/kolon adlarında özel karakter veya boşluk olmamalı (sadece harf, rakam ve `_`).
+
+### LibreOffice hatası
+
+Bazı formatların PDF’e dönüştürülmesi için `soffice` komutu gerekir. Kurulu değilse:
+
+```bash
+sudo apt-get install -y libreoffice
+```
+
+### OCR yavaş veya GPU hatası
+
+Falcon-OCR modeli büyüktür; CPU’da yavaş çalışabilir. GPU yoksa sabırlı olun veya daha küçük bir OCR modeli kullanın.
+
+---
+
+## Güvenlik Notları
+
+- MSSQL şifresi **Fernet** ile şifrelenerek veritabanında saklanır, API asla şifreyi döndürmez.
+- SQL sorgularında tablo/kolon adları sıkı bir beyaz liste ile doğrulanır (injection önlenir).
+- Sistem tamamen yerel çalışır; belgeleriniz ve sorgularınız dışarı sızmaz.
+- Yine de hassas verilerle kullanırken ağ erişimini sınırlandırmanız önerilir.
+
+---
